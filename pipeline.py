@@ -1,0 +1,1037 @@
+#!/usr/bin/env python3
+"""
+参数化 <<大众电影>> PDF -> 解说视频 管线。
+可被 Web 应用 (app.py) 调用，也支持命令行直接跑。
+
+流程:
+  PDF --(fitz)--> 每页图片
+       --(每 pages_per_clip 页并排)--> 内容帧
+       --(封面+标题)--> 标题卡
+       --(ffmpeg loop)--> 静音视频 (封面 title_duration + 片段*clip_duration)
+       --(edge-tts)--> 每段旁白 -> 调整到 clip_duration -> 合成音轨
+       --(mux)--> 最终 MP4
+"""
+import os
+import sys
+import io
+import re
+import json
+import time
+import math
+import asyncio
+import subprocess
+
+import fitz
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import edge_tts
+
+W, H = 1920, 1080   # 默认输出尺寸（16:9 1080p）；实际由参数计算，见 compute_dimensions
+
+
+def _even(x):
+    x = int(round(x))
+    return x if x % 2 == 0 else x + 1
+
+
+def compute_dimensions(aspect="16:9", custom_w=16, custom_h=9, quality=1080):
+    """
+    由「宽高比 + 清晰度」算出输出像素尺寸 (W, H)，保证为偶数（H.264 要求）。
+    aspect: "16:9" / "9:16" / "4:3" / "1:1" / "custom"
+    quality: 短边像素（1080 / 720 / 480 …）。
+      - 横屏(宽>=高): 高=quality，宽按比例；竖屏(高>宽): 宽=quality，高按比例。
+    """
+    try:
+        if aspect == "custom":
+            aw, ah = float(custom_w), float(custom_h)
+        else:
+            aw, ah = (float(x) for x in aspect.split(":"))
+        if aw <= 0 or ah <= 0:
+            raise ValueError
+    except Exception:
+        aw, ah = 16.0, 9.0
+    q = max(160, min(2160, int(quality)))     # 合理范围，防止极端值
+    if aw >= ah:                              # 横屏 / 方形
+        h = q
+        w = q * aw / ah
+    else:                                     # 竖屏
+        w = q
+        h = q * ah / aw
+    w, h = _even(w), _even(h)
+    # 上限保护，避免超大分辨率把机器拖垮
+    if max(w, h) > 3840:
+        s = 3840 / max(w, h)
+        w, h = _even(w * s), _even(h * s)
+    return w, h
+
+
+# ----------------------------------------------------------------------------
+# 基础工具
+# ----------------------------------------------------------------------------
+def run_ffmpeg(cmd, desc="ffmpeg"):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ERROR in {desc}:")
+        print(f"  {result.stderr[-800:]}")
+        return False
+    return True
+
+
+def get_duration(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True
+    )
+    return float(result.stdout.strip())
+
+
+# ----------------------------------------------------------------------------
+# TTS (edge-tts)
+# ----------------------------------------------------------------------------
+def generate_tts_edge(text, output_wav, voice, rate):
+    if not text or not text.strip():
+        # 空旁白 -> 生成一小段静音
+        cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+               "-t", "0.1", "-c:a", "pcm_s16le", output_wav]
+        return run_ffmpeg(cmd, "null wav")
+    tmp_mp3 = output_wav + ".mp3"
+    last_err = ""
+    for attempt in range(1, 4):
+        try:
+            async def _run():
+                comm = edge_tts.Communicate(text, voice, rate=rate)
+                await comm.save(tmp_mp3)
+            asyncio.run(_run())
+            if os.path.exists(tmp_mp3) and os.path.getsize(tmp_mp3) > 500:
+                break
+        except Exception as e:
+            last_err = str(e)
+            print(f"    edge-tts attempt {attempt} failed: {e}")
+            time.sleep(2)
+    else:
+        raise RuntimeError(
+            "TTS 连接微软语音服务失败（edge-tts 需能访问 speech.platform.bing.com）。"
+            "请检查网络 / 防火墙 / 代理，确认能联网后重试。原始错误: " + last_err)
+    cmd = ["ffmpeg", "-y", "-i", tmp_mp3,
+           "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", output_wav]
+    ok = run_ffmpeg(cmd, "mp3->wav")
+    try:
+        os.remove(tmp_mp3)
+    except OSError:
+        pass
+    return ok
+
+
+# ----------------------------------------------------------------------------
+# 页码选择：把 "1~10,15~20,30" 解析为页索引，并抽取子 PDF
+# ----------------------------------------------------------------------------
+def parse_page_range(spec, N):
+    """
+    解析形如 "1~10,15~20,30" 的页码表达式，返回 0-based 页索引列表（按填写顺序、去重）。
+    支持分隔符：, ，  区间符：~ ～ - －  页码为 1-based。越界忽略。
+    spec 为空 / 无有效项 -> 返回全部页 [0..N-1]。
+    """
+    if not spec or not spec.strip():
+        return list(range(N))
+    s = (spec.replace("，", ",").replace("～", "~")
+             .replace("－", "-").replace("—", "-").replace(" ", ""))
+    result, seen = [], set()
+
+    def add(idx):
+        if 0 <= idx < N and idx not in seen:
+            seen.add(idx)
+            result.append(idx)
+
+    for part in s.split(","):
+        if not part:
+            continue
+        m = re.match(r"^(\d+)[-~](\d+)$", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > b:
+                a, b = b, a
+            for p in range(a, b + 1):
+                add(p - 1)          # 1-based -> 0-based
+        elif part.isdigit():
+            add(int(part) - 1)
+        # 其它非法片段静默忽略
+    return result if result else list(range(N))
+
+
+def build_selected_pdf(src_path, out_path, pages0):
+    """按 0-based 页索引（保持顺序）抽取子 PDF 到 out_path，返回 out_path。"""
+    src = fitz.open(src_path)
+    new = fitz.open()
+    for p in pages0:
+        if 0 <= p < src.page_count:
+            new.insert_pdf(src, from_page=p, to_page=p)
+    new.save(out_path)
+    new.close()
+    src.close()
+    return out_path
+
+
+def make_working_pdf(src_path, out_path, spec):
+    """
+    根据页码表达式产出“实际参与制作”的 PDF：
+      - spec 选中的是全部页 -> 直接返回原 PDF 路径（不复制）。
+      - 选中子集 -> 抽成子 PDF 返回其路径。
+    返回 (working_pdf_path, selected_count)。
+    """
+    src = fitz.open(src_path)
+    N = src.page_count
+    src.close()
+    pages0 = parse_page_range(spec, N)
+    if len(pages0) == N and pages0 == list(range(N)):
+        return src_path, N
+    build_selected_pdf(src_path, out_path, pages0)
+    return out_path, len(pages0)
+
+
+# ----------------------------------------------------------------------------
+# 文字提取：文字层优先，否则 OCR (子进程分批，保护主进程)
+# ----------------------------------------------------------------------------
+def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
+                       ocr_worker=None, py_exe=None, ocr_lang="ch_sim"):
+    """返回 list[str]，每页一段文字。文字层优先；若全空且 use_ocr，则跑 OCR。
+    ocr_lang: 'ch_sim'(简体) 或 'ch_tra'(繁体)，均搭配英文。"""
+    doc = fitz.open(pdf_path)
+    N = doc.page_count
+    pages = []
+    for i in range(N):
+        pages.append(doc[i].get_text().strip())
+    doc.close()
+
+    has_text = any(p.strip() for p in pages)
+    if has_text:
+        if progress_cb:
+            progress_cb("extract", 1.0, f"检测到文字层，已提取 {N} 页")
+        return pages
+
+    if not use_ocr:
+        if progress_cb:
+            progress_cb("extract", 1.0, "未检测到文字层（纯图片），需启用 OCR")
+        return pages
+
+    # OCR 结果放在任务自己的目录下（不再用进程 PID 命名的公共临时文件，
+    # 否则同一 Flask 进程里并发的两个任务会写到同一个文件、互相污染）。
+    out_txt = os.path.join(os.path.dirname(pdf_path), "ocr.txt")
+    if os.path.exists(out_txt):
+        os.remove(out_txt)
+    ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe, ocr_lang)
+    return parse_ocr_txt(out_txt, N)
+
+
+def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
+                       ocr_lang="ch_sim"):
+    """
+    以子进程跑 OCR。一次子进程处理「所有剩余页」，把 torch/easyocr 的加载成本
+    只付一次；子进程中途崩溃则重新拉起、从断点续跑。
+
+    进度：子进程会把每页结果**即时**写入 out_txt，这里用 Popen + 轮询该文件，
+    因此进度会随识别逐页刷新（不会像阻塞式那样一直卡在 0）。加载/下载模型阶段
+    （还没有任何页完成时）会显示专门的提示。
+
+    健壮性：若连续多次子进程都没有推进任何一页（例如 easyocr 环境损坏、
+    模型下载失败/被墙、或某页永远卡死），不再无限重试，而是抛出明确错误，
+    避免任务永远卡在“OCR 识别中”。
+    """
+    py_exe = py_exe or sys.executable
+    N = fitz.open(pdf_path).page_count
+    max_stalls = 3           # 连续无进展的最大次数
+    stalls = 0
+    last_err = ""
+    err_log = out_txt + ".stderr.log"
+    while True:
+        done = count_ocr_pages(out_txt)
+        if done >= N:
+            break
+        # 给足超时：按剩余页数估算（每页最多约 120s），至少 10 分钟。
+        timeout = max(600, (N - done) * 120)
+        deadline = time.time() + timeout
+        # 用 Popen 非阻塞启动；stderr 落到日志文件，避免管道写满导致子进程卡死。
+        try:
+            ef = open(err_log, "w", encoding="utf-8", errors="replace")
+            proc = subprocess.Popen(
+                [py_exe, ocr_worker, pdf_path, str(done), str(N), out_txt, ocr_lang],
+                stdout=subprocess.DEVNULL, stderr=ef, text=True)
+        except Exception as e:
+            last_err = f"无法启动 OCR 子进程: {e}"
+            print("  " + last_err)
+            stalls += 1
+            if stalls >= max_stalls:
+                raise RuntimeError(last_err)
+            continue
+
+        # 轮询进度，直到子进程退出 / 卡死 / 超时。
+        # 关键：单独设“无新页看门狗”——加载模型或识别单页在 STALL_SECONDS 内没有
+        # 任何一页完成，就判定卡死并杀掉重试，避免整批超时（可能长达一小时）拖着不动。
+        STALL_SECONDS = 300      # 5 分钟内必须出现新页，否则视为卡死
+        killed = False
+        t_start = time.time()
+        seen = done
+        t_last_advance = t_start
+        while proc.poll() is None:
+            cur = count_ocr_pages(out_txt)
+            now = time.time()
+            if cur > seen:
+                seen = cur
+                t_last_advance = now
+            if progress_cb:
+                if cur <= done:
+                    el = int(now - t_start)
+                    tip = f"正在加载 OCR 模型并识别首页…（已 {el}s）"
+                    if stalls > 0:
+                        tip = (f"OCR 重试中（第 {stalls+1} 次，已 {el}s）"
+                               f"{'；上次: ' + last_err[:80] if last_err else ''}")
+                    progress_cb("ocr", cur / N, tip)
+                else:
+                    progress_cb("ocr", cur / N, f"OCR 识别中 {cur}/{N} 页")
+            if now - t_last_advance > STALL_SECONDS:
+                proc.kill()
+                killed = True
+                last_err = (f"{STALL_SECONDS}s 内无新页（疑似卡在模型加载/联网或某页），"
+                            f"已终止并重试")
+                print("  " + last_err)
+                break
+            if now > deadline:
+                proc.kill()
+                killed = True
+                last_err = f"worker 超时（{int(timeout)}s）"
+                print("  " + last_err)
+                break
+            time.sleep(2)
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            proc.kill()
+        ef.close()
+        rc = proc.returncode
+        if not killed and rc not in (0, None):
+            last_err = _summarize_err(_tail_file(err_log, 4000)) or \
+                f"worker 异常退出（returncode={rc}）"
+            print(f"  OCR worker exit {rc}: {last_err}")
+
+        new_done = count_ocr_pages(out_txt)
+        if new_done <= done:                 # 本轮没有识别出任何新页
+            stalls += 1
+            if stalls >= max_stalls:
+                hint = ("常见原因：① 首次运行无法联网下载 easyocr 模型；"
+                        "② easyocr/torch 未装好。")
+                if "not enough memory" in last_err or "out of memory" in last_err.lower():
+                    hint = ("内存不足：easyocr/torch 加载模型或识别大图时内存不够。"
+                            "请关闭其它占内存的程序后重试，或调小 _ocr_worker.py 里的 "
+                            "CANVAS_SIZE / RENDER_ZOOM。")
+                raise RuntimeError(
+                    f"OCR 连续 {max_stalls} 次未取得进展（已完成 {done}/{N} 页）。"
+                    f"最后错误: {last_err or '子进程无输出'}。{hint}")
+        else:
+            stalls = 0
+    if progress_cb:
+        progress_cb("ocr", 1.0, f"OCR 完成 {N}/{N} 页")
+
+
+def _tail_file(path, nchars):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()[-nchars:]
+    except OSError:
+        return ""
+
+
+def _summarize_err(text):
+    """从子进程 stderr 里挑出最有信息量的一行（异常类型行），去掉冗长堆栈。"""
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if ("Error" in ln or "error" in ln or "memory" in ln.lower()
+                or "Exception" in ln):
+            return ln[:300]
+    return lines[-1][:300] if lines else ""
+
+
+
+
+
+
+def count_ocr_pages(out_txt):
+    if not os.path.exists(out_txt):
+        return 0
+    with open(out_txt, encoding="utf-8") as f:
+        return len(re.findall(r"========== PAGE \d+", f.read()))
+
+
+def parse_ocr_txt(out_txt, N):
+    if not os.path.exists(out_txt):
+        return [""] * N
+    with open(out_txt, encoding="utf-8") as f:
+        content = f.read()
+    blocks = re.split(r"========== PAGE \d+ ==========", content)
+    # blocks[0] 是头部，之后每段对应一页
+    texts = []
+    for b in blocks[1:N+1]:
+        texts.append(b.strip())
+    while len(texts) < N:
+        texts.append("")
+    return texts[:N]
+
+
+def group_into_clips(page_texts, pages_per_clip):
+    """把每页文字按 pages_per_clip 分组，得到每个片段的旁白候选。"""
+    n = len(page_texts)
+    clips = (n + pages_per_clip - 1) // pages_per_clip
+    groups = []
+    for c in range(clips):
+        chunk = page_texts[c * pages_per_clip:(c + 1) * pages_per_clip]
+        groups.append("\n".join(t for t in chunk if t.strip()))
+    return groups
+
+
+# ----------------------------------------------------------------------------
+# 图像合成
+# ----------------------------------------------------------------------------
+def extract_pages(pdf_path, video_dir, progress_cb=None):
+    os.makedirs(video_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    page_count = doc.page_count
+    zoom = 150 / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    for i in range(page_count):
+        pix = doc[i].get_pixmap(matrix=mat)
+        out = os.path.join(video_dir, f"page_{i+1:02d}.png")
+        pix.save(out)
+        if progress_cb and i % 8 == 0:
+            progress_cb("frames", i / page_count, f"提取页面 {i+1}/{page_count}")
+    doc.close()
+    return page_count
+
+
+def create_combined_frames(total_pages, pages_per_clip, video_dir,
+                           width=W, height=H, progress_cb=None):
+    frame_paths = []
+    for i in range(0, total_pages, pages_per_clip):
+        imgs = []
+        for j in range(i, min(i + pages_per_clip, total_pages)):
+            p = os.path.join(video_dir, f"page_{j+1:02d}.png")
+            if os.path.exists(p):
+                imgs.append(Image.open(p).convert("RGB"))
+        if not imgs:
+            continue
+        # 水平并排
+        total_w = sum(im.width for im in imgs)
+        max_h = max(im.height for im in imgs)
+        combined = Image.new("RGB", (total_w, max_h), (255, 255, 255))
+        x = 0
+        for im in imgs:
+            combined.paste(im, (x, 0))
+            x += im.width
+        combined = trim_white_border(combined)
+        scale = min(width / combined.width, height / combined.height)
+        combined = combined.resize((max(1, int(combined.width * scale)),
+                                    max(1, int(combined.height * scale))), Image.LANCZOS)
+        canvas = Image.new("RGB", (width, height), (20, 20, 20))
+        canvas.paste(combined, ((width - combined.width) // 2, (height - combined.height) // 2))
+        out = os.path.join(video_dir, f"frame_{len(frame_paths)+1:02d}.png")
+        canvas.save(out, quality=95)
+        frame_paths.append(out)
+        if progress_cb:
+            progress_cb("frames", (i + 1) / total_pages, f"合成帧 {len(frame_paths)}")
+    return frame_paths
+
+
+def trim_white_border(img, pad=6):
+    # 用像素差异找内容边界
+    gray = img.convert("L")
+    bw = gray.point(lambda p: 0 if p > 240 else 255)
+    bbox = bw.getbbox()
+    if bbox:
+        bbox = (max(0, bbox[0] - pad), max(0, bbox[1] - pad),
+                min(img.width, bbox[2] + pad), min(img.height, bbox[3] + pad))
+        return img.crop(bbox)
+    return img
+
+
+def create_title_card(video_dir, font_path, title, subtitle, feature,
+                      feature2, feature3, tagline, width=W, height=H):
+    """
+    自适应标题卡：随输出尺寸(width,height)缩放；
+    横屏(宽>高)用「封面左·文字右」，竖屏/方形用「封面上·文字下」堆叠。
+    """
+    title_path = os.path.join(video_dir, "title_card.png")
+    cover_path = os.path.join(video_dir, "page_01.png")
+    cover = Image.open(cover_path).convert("RGB")
+
+    Wd, Ht = width, height
+    base = min(Wd, Ht)
+    canvas = Image.new("RGB", (Wd, Ht), (25, 12, 5))
+    draw = ImageDraw.Draw(canvas)
+
+    # 背景：径向渐变 + 顶部光带
+    R = max(Wd, Ht)
+    for r in range(R, 0, -4):
+        alpha = max(0, min(255, int(55 * (1 - r / R))))
+        c = (min(255, 55 + alpha), min(255, 30 + alpha), min(255, 12 + alpha))
+        draw.ellipse([(Wd // 2 - r, Ht // 2 - r), (Wd // 2 + r, Ht // 2 + r)], outline=c)
+    band = max(20, int(Ht * 0.093))
+    for i in range(band):
+        alpha = int(30 * (1 - i / band))
+        c = (55 + alpha, 35 + alpha, 18 + alpha)
+        draw.line([(0, i), (Wd, i)], fill=c)
+
+    def font(px):
+        try:
+            return ImageFont.truetype(font_path, max(10, int(px)))
+        except Exception:
+            return ImageFont.load_default()
+    font_large = font(base * 0.093)
+    font_mid = font(base * 0.048)
+    font_small = font(base * 0.033)
+    font_tiny = font(base * 0.026)
+    font_badge = font(base * 0.030)
+
+    def draw_cover(x, y, w, h):
+        cov = cover.resize((w, h), Image.LANCZOS)
+        so = max(6, int(base * 0.009))
+        shadow = Image.new("RGBA", (w + so * 2, h + so * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rectangle([so, so, w + so, h + so], fill=(0, 0, 0, 140))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(max(6, int(base * 0.011))))
+        canvas.paste(shadow, (x - so, y - so), shadow)
+        op, ip = max(4, int(base * 0.007)), max(2, int(base * 0.003))
+        canvas.paste(Image.new("RGB", (w + op * 2, h + op * 2), (180, 150, 100)), (x - op, y - op))
+        canvas.paste(Image.new("RGB", (w + ip * 2, h + ip * 2), (220, 190, 140)), (x - ip, y - ip))
+        canvas.paste(cov, (x, y))
+
+    def ctext(cx, y, text, fnt, fill, shadow=False):
+        b = draw.textbbox((0, 0), text, font=fnt)
+        tw, th = b[2] - b[0], b[3] - b[1]
+        x = int(cx - tw / 2)
+        if shadow:
+            off = max(2, int(base * 0.004))
+            draw.text((x + off, y + off), text, font=fnt, fill=(0, 0, 0))
+        draw.text((x, y), text, font=fnt, fill=fill)
+        return th
+
+    def draw_badges(cx, y):
+        """在中心 cx 处从 y 起，居中堆叠 feature/feature2/feature3，返回新 y。"""
+        if feature:
+            b = draw.textbbox((0, 0), feature, font=font_badge)
+            tw, th = b[2] - b[0], b[3] - b[1]
+            pad = max(8, int(base * 0.014))
+            draw.rectangle([cx - tw // 2 - pad, y - 5, cx + tw // 2 + pad, y + th + 10],
+                           fill=(160, 50, 40))
+            ctext(cx, y, feature, font_badge, (255, 230, 180))
+            y += th + int(base * 0.032)
+        if feature2:
+            y += ctext(cx, y, feature2, font_small, (255, 200, 100)) + int(base * 0.02)
+        if feature3:
+            y += ctext(cx, y, feature3, font_tiny, (200, 170, 120)) + int(base * 0.02)
+        return y
+
+    title = title or "大众电影"
+    vertical = Ht >= Wd * 0.95      # 竖屏或近方形 -> 堆叠布局
+
+    if not vertical:
+        # ---- 横屏：封面左、文字右 ----
+        margin = int(Wd * 0.026)
+        target_w = int(Wd * 0.42)
+        target_h = int(cover.height * (target_w / cover.width))
+        max_h = int(Ht * 0.86)
+        if target_h > max_h:
+            target_h = max_h
+            target_w = int(cover.width * (target_h / cover.height))
+        y_off = (Ht - target_h) // 2
+        draw_cover(margin, y_off, target_w, target_h)
+
+        right_x = margin + target_w + int(Wd * 0.068)
+        right_w = Wd - right_x - int(Wd * 0.042)
+        cx = right_x + right_w // 2
+
+        line_y1 = int(Ht * 0.167)
+        draw.line([(right_x, line_y1), (right_x + right_w, line_y1)],
+                  fill=(200, 170, 100), width=max(2, int(base * 0.003)))
+        rr = max(3, int(base * 0.004))
+        for dx in (-int(base * 0.009), int(base * 0.009)):
+            draw.ellipse([(cx + dx - rr, line_y1 - rr), (cx + dx + rr, line_y1 + rr)],
+                         fill=(200, 170, 100))
+
+        y = int(Ht * 0.204)
+        y += ctext(cx, y, title, font_large, (255, 210, 130), shadow=True) + int(Ht * 0.037)
+        if subtitle:
+            y += ctext(cx, y, subtitle, font_mid, (220, 220, 220)) + int(Ht * 0.028)
+            draw.line([(right_x + int(right_w * 0.1), y), (right_x + right_w - int(right_w * 0.1), y)],
+                      fill=(180, 150, 90), width=2)
+            y += int(Ht * 0.03)
+        else:
+            y += int(Ht * 0.02)
+        draw_badges(cx, y)
+        tag_center = cx
+        tag_lw = right_w
+        tag_x0 = right_x
+    else:
+        # ---- 竖屏/方形：封面上、文字下（堆叠居中）----
+        cx = Wd // 2
+        top = int(Ht * 0.06)
+        target_w = int(Wd * 0.66)
+        target_h = int(cover.height * (target_w / cover.width))
+        max_h = int(Ht * 0.5)
+        if target_h > max_h:
+            target_h = max_h
+            target_w = int(cover.width * (target_h / cover.height))
+        draw_cover(cx - target_w // 2, top, target_w, target_h)
+
+        y = top + target_h + int(Ht * 0.045)
+        lw = int(Wd * 0.5)
+        draw.line([(cx - lw // 2, y), (cx + lw // 2, y)],
+                  fill=(200, 170, 100), width=max(2, int(base * 0.003)))
+        y += int(Ht * 0.02)
+        y += ctext(cx, y, title, font_large, (255, 210, 130), shadow=True) + int(Ht * 0.022)
+        if subtitle:
+            y += ctext(cx, y, subtitle, font_mid, (220, 220, 220)) + int(Ht * 0.022)
+        draw_badges(cx, y)
+        tag_center = cx
+        tag_lw = int(Wd * 0.7)
+        tag_x0 = cx - tag_lw // 2
+
+    if tagline:
+        y_tag = Ht - int(Ht * 0.11)
+        draw.line([(tag_x0 + int(tag_lw * 0.15), y_tag - int(Ht * 0.028)),
+                   (tag_x0 + tag_lw - int(tag_lw * 0.15), y_tag - int(Ht * 0.028))],
+                  fill=(200, 170, 100), width=2)
+        ctext(tag_center, y_tag, tagline, font_tiny, (180, 160, 120))
+
+    canvas.save(title_path, quality=95)
+    return title_path
+
+
+def create_silent_video(title_path, frame_paths, title_duration, clip_durations,
+                        video_dir, width=W, height=H, progress_cb=None):
+    """clip_durations: 与 frame_paths 等长的每片段时长列表（秒）。"""
+    video_path = os.path.join(video_dir, "silent_video.mp4")
+    segments = []
+    vf = (f"format=yuv420p,scale={width}:{height}:force_original_aspect_ratio=decrease,"
+          f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
+    all_files = [(title_path, title_duration)] + list(zip(frame_paths, clip_durations))
+    n = len(all_files)
+    for i, (img_path, dur) in enumerate(all_files):
+        seg_path = os.path.join(video_dir, f"seg_{i:03d}.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-loop", "1", "-i", img_path, "-t", str(dur),
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-r", "30", seg_path
+        ]
+        if not run_ffmpeg(cmd, f"segment {i+1}"):
+            return None
+        segments.append(seg_path)
+        if progress_cb:
+            # 0.60~0.78 之间铺开，让“编码静音视频”有实时进度
+            progress_cb("video", 0.60 + 0.18 * (i + 1) / n,
+                        f"编码静音视频 {i+1}/{n} 段")
+
+    concat_path = os.path.join(video_dir, "video_concat.txt")
+    with open(concat_path, "w", encoding="utf-8") as f:
+        for seg_path in segments:
+            f.write(f"file '{seg_path.replace(chr(92), '/')}'\n")
+
+    total = title_duration + sum(clip_durations)
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_path,
+           "-c", "copy", "-t", str(total), video_path]
+    if not run_ffmpeg(cmd, "concat video"):
+        return None
+    return video_path
+
+
+# ----------------------------------------------------------------------------
+# 音频：先合成每段旁白并测时长，再按每片段目标时长拼装
+# ----------------------------------------------------------------------------
+def _atempo_filters(factor):
+    """把任意加速倍率拆成若干个落在 [0.5, 2.0] 区间的 atempo（ffmpeg 单次限制）。"""
+    filters = []
+    f = factor
+    while f > 2.0:
+        filters.append("atempo=2.0")
+        f /= 2.0
+    if f > 1.0001:
+        filters.append(f"atempo={f:.6f}")
+    return filters
+
+
+def _write_silence(path, seconds=0.1):
+    run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", str(seconds), "-ar", "44100", "-ac", "2",
+                "-c:a", "pcm_s16le", path], "silence")
+
+
+def synth_narration(narration, narration_dir, voice, rate, progress_cb=None):
+    """
+    为每段旁白生成 wav，返回 (wav_paths, raw_durations)。
+
+    单段 TTS 失败（多为网络问题）不会立即中断：该段退化为静音并继续，
+    但会统计失败数。若**所有非空旁白**都失败（说明整体连不上语音服务），
+    则抛出明确的网络错误，让前端直接看到原因。
+    """
+    os.makedirs(narration_dir, exist_ok=True)
+    clips = len(narration)
+    wavs, durs = [], []
+    nonempty = 0
+    failures = 0
+    last_err = ""
+    for i, text in enumerate(narration):
+        wav_in = os.path.join(narration_dir, f"sec_{i:02d}.wav")
+        has_text = bool(text and text.strip())
+        if has_text:
+            nonempty += 1
+        try:
+            generate_tts_edge(text, wav_in, voice, rate)
+        except Exception as e:      # 网络等原因导致该段失败
+            last_err = str(e)
+            if has_text:
+                failures += 1
+            print(f"    旁白 {i+1} TTS 失败，改为静音: {e}")
+            _write_silence(wav_in)
+        if not os.path.exists(wav_in):
+            _write_silence(wav_in)
+        wavs.append(wav_in)
+        durs.append(get_duration(wav_in))
+        if progress_cb:
+            progress_cb("tts", (i + 1) / max(1, clips), f"合成旁白 {i+1}/{clips}")
+
+    if nonempty > 0 and failures >= nonempty:
+        # 所有有内容的旁白都失败 -> 视为整体网络不可用，明确报错
+        raise RuntimeError(last_err or
+            "TTS 全部失败：无法连接微软语音服务，请检查网络/代理后重试。")
+    if failures > 0:
+        print(f"  警告：{failures}/{nonempty} 段旁白 TTS 失败，已用静音代替。")
+    return wavs, durs
+
+
+def assemble_audio(wavs, clip_durations, title_duration, narration_dir,
+                   progress_cb=None):
+    """把每段 wav 适配到对应的片段时长（过长则加速，过短则补静音），拼成整条音轨。"""
+    clips = len(wavs)
+    padded_paths = []
+    for i, (wav_in, clip_duration) in enumerate(zip(wavs, clip_durations)):
+        d = get_duration(wav_in)
+        out = os.path.join(narration_dir, f"pad_{i:02d}.wav")
+        filters = []
+        if d > clip_duration + 0.05:
+            filters.extend(_atempo_filters(d / clip_duration))
+        filters.append(f"apad,atrim=0:{clip_duration}")
+        filters.append("volume=1.5")
+        cmd = ["ffmpeg", "-y", "-i", wav_in, "-af", ",".join(filters),
+               "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out]
+        if not run_ffmpeg(cmd, f"pad {i+1}"):
+            return None
+        padded_paths.append(out)
+        if progress_cb:
+            progress_cb("tts", (i + 1) / max(1, clips), f"拼装旁白 {i+1}/{clips}")
+
+    # 封面静音段
+    silence = os.path.join(narration_dir, "silence_title.wav")
+    run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", str(title_duration), "-c:a", "pcm_s16le", silence])
+
+    concat_list = os.path.join(narration_dir, "concat.txt")
+    with open(concat_list, "w", encoding="utf-8") as f:
+        f.write(f"file '{silence.replace(chr(92), '/')}'\n")
+        for p in padded_paths:
+            f.write(f"file '{p.replace(chr(92), '/')}'\n")
+
+    concat_out = os.path.join(narration_dir, "concat_out.wav")
+    if not run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+                       "-c", "copy", concat_out], "concat audio"):
+        return None
+
+    final_audio = os.path.join(narration_dir, "final_audio.aac")
+    total = title_duration + sum(clip_durations)
+    fade_out_start = max(0.0, total - 3.0)
+    cmd = ["ffmpeg", "-y", "-i", concat_out,
+           "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={fade_out_start}:d=3.0",
+           "-c:a", "aac", "-b:a", "192k", "-t", str(total), final_audio]
+    if not run_ffmpeg(cmd, "finalize audio"):
+        return None
+    return final_audio
+
+
+# ----------------------------------------------------------------------------
+# 字幕：由旁白文本 + 每片段时长生成 SRT，可选烧录进画面
+# ----------------------------------------------------------------------------
+def _srt_ts(sec):
+    if sec < 0:
+        sec = 0
+    ms = int(round(sec * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def split_caption(text, max_len=20):
+    """把一段旁白切成适合单条字幕的小段：先按句末标点断句，过长再按次级标点/长度切。"""
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return []
+    # 先按句末标点断（保留标点）
+    parts = re.split(r"(?<=[。！？!?；;\.])", text)
+    chunks = []
+    for p in parts:
+        p = p.strip()
+        while len(p) > max_len:
+            # 尽量在次级标点（，、,）处断，否则硬切
+            cut = -1
+            for sep in "，,、":
+                idx = p.rfind(sep, 0, max_len + 1)
+                if idx > cut:
+                    cut = idx
+            if cut < max_len * 0.5:
+                cut = max_len - 1
+            chunks.append(p[:cut + 1].strip())
+            p = p[cut + 1:].strip()
+        if p:
+            chunks.append(p)
+    return [c for c in chunks if c]
+
+
+def build_srt(narration, clip_durations, raw_durs, title_duration):
+    """
+    生成 SRT 字幕字符串。
+    时间轴：封面(title_duration)无字幕；随后第 i 段从 start_i 起，
+    其“说话时长”= min(该段原始配音时长, 该段片段时长)，把切好的小段按字数比例铺在这段时间里。
+    """
+    lines = []
+    idx = 1
+    t = float(title_duration)
+    for i, text in enumerate(narration):
+        dur = float(clip_durations[i])
+        raw = float(raw_durs[i]) if i < len(raw_durs) else 0.0
+        speak = min(raw, dur) if raw > 0.15 else 0.0
+        caps = split_caption(text) if speak > 0 else []
+        if caps:
+            total_ch = sum(len(c) for c in caps) or 1
+            cur = t
+            for j, c in enumerate(caps):
+                seg = speak * (len(c) / total_ch)
+                s = cur
+                e = t + speak if j == len(caps) - 1 else cur + seg
+                if e - s < 0.3:            # 太短的给个下限
+                    e = min(t + speak, s + 0.3)
+                lines.append(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{c}\n")
+                idx += 1
+                cur += seg
+        t += dur
+    return "\n".join(lines)
+
+
+def burn_subtitles(video_in, srt_path, video_out, font_dir, font_name, height):
+    """
+    把 SRT 硬烧进画面并重编码。
+    关键：Windows 绝对路径里的 ':' '\\' 会破坏 ffmpeg 滤镜串解析，
+    所以把字体拷到字幕同目录、cwd 设到该目录，滤镜里只用相对文件名和 fontsdir=. 。
+    """
+    import shutil
+    srt_dir = os.path.dirname(os.path.abspath(srt_path))
+    srt_name = os.path.basename(srt_path)
+    # 把中文字体拷到字幕目录，供 libass 用 fontsdir=. 找到（STKaiti 非系统字体）
+    try:
+        src_font = os.path.join(font_dir, "font.ttf")
+        if os.path.exists(src_font):
+            shutil.copy(src_font, os.path.join(srt_dir, "subfont.ttf"))
+    except Exception:
+        pass
+    font_size = max(14, int(height * 0.045))
+    style = (f"FontName={font_name},FontSize={font_size},"
+             "PrimaryColour=&H00FFFFFF,OutlineColour=&H00202020,"
+             "BorderStyle=1,Outline=2,Shadow=1,MarginV=40")
+    vf = f"subtitles={srt_name}:fontsdir=.:force_style='{style}'"
+    cmd = ["ffmpeg", "-y", "-i", os.path.abspath(video_in), "-vf", vf,
+           "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-c:a", "copy", "-movflags", "+faststart", os.path.abspath(video_out)]
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=srt_dir)
+    if result.returncode != 0:
+        print("  ERROR in burn subtitles:")
+        print("  " + (result.stderr or "")[-800:])
+        return False
+    return True
+
+
+# ----------------------------------------------------------------------------
+# 总入口
+# ----------------------------------------------------------------------------
+def build_video(pdf_path, out_path, params, narration, progress_cb=None):
+    """
+    params: dict(
+        pages_per_clip, clip_duration, title_duration,
+        title, subtitle, feature, feature2, feature3, tagline,
+        voice, rate, font_path
+    )
+    narration: list[str] 每个内容片段的旁白 (长度应等于片段数)
+    返回 out_path 或 None
+    """
+    pages_per_clip = max(1, int(params.get("pages_per_clip", 2)))
+    clip_duration = float(params.get("clip_duration", 12.0))
+    title_duration = float(params.get("title_duration", 3.0))
+    voice = params.get("voice", "zh-CN-YunxiNeural")
+    rate = params.get("rate", "+6%")
+    font_path = params.get("font_path")
+    # 新功能：根据解说词自动延长片段时长
+    auto_duration = bool(params.get("auto_duration", False))
+    max_clip_duration = float(params.get("max_clip_duration", 60.0))
+    tail_pad = float(params.get("tail_pad", 1.0))
+    # 新功能：输出宽高比 + 清晰度 -> 像素尺寸
+    Wd, Ht = compute_dimensions(
+        params.get("aspect", "16:9"),
+        params.get("custom_w", 16), params.get("custom_h", 9),
+        int(params.get("quality", 1080)))
+
+    workdir = os.path.splitext(out_path)[0] + "_work"
+    video_dir = os.path.join(workdir, "video")
+    narration_dir = os.path.join(workdir, "narration")
+    os.makedirs(video_dir, exist_ok=True)
+    os.makedirs(narration_dir, exist_ok=True)
+
+    # Step 1: 提取页面
+    if progress_cb:
+        progress_cb("frames", 0.0, "提取 PDF 页面")
+    total_pages = extract_pages(pdf_path, video_dir, progress_cb)
+
+    # 片段数（封面帧用 page_01，内容帧从全部页合成）
+    clips = (total_pages + pages_per_clip - 1) // pages_per_clip
+    # 对齐 narration 长度
+    if narration is None:
+        narration = [""] * clips
+    if len(narration) < clips:
+        narration = narration + [""] * (clips - len(narration))
+    elif len(narration) > clips:
+        narration = narration[:clips]
+
+    # Step 2: 内容帧
+    if progress_cb:
+        progress_cb("frames", 0.3, "合成内容帧")
+    frame_paths = create_combined_frames(total_pages, pages_per_clip, video_dir,
+                                         Wd, Ht, progress_cb)
+    # 以实际生成的画面帧数为准，对齐旁白与时长（避免缺页导致音画错位）
+    nframes = len(frame_paths)
+    if len(narration) < nframes:
+        narration = narration + [""] * (nframes - len(narration))
+    else:
+        narration = narration[:nframes]
+
+    # Step 3: 标题卡
+    if progress_cb:
+        progress_cb("title", 0.5, "生成标题卡")
+    title_path = create_title_card(
+        video_dir, font_path,
+        params.get("title", "大众电影"), params.get("subtitle", ""),
+        params.get("feature", ""), params.get("feature2", ""),
+        params.get("feature3", ""), params.get("tagline", ""),
+        Wd, Ht)
+
+    # Step 4: 先合成旁白（测得每段真实时长，供“自动延长片段时长”使用）
+    if progress_cb:
+        progress_cb("tts", 0.55, "生成旁白音频")
+    wavs, raw_durs = synth_narration(narration, narration_dir, voice, rate, progress_cb)
+
+    # 每片段“基准时长”：优先用前端传来的逐片段时长(clip_durations)，否则用全局 clip_duration。
+    base_durs = params.get("clip_durations") or []
+    try:
+        base_durs = [float(x) for x in base_durs]
+    except Exception:
+        base_durs = []
+    if len(base_durs) < nframes:
+        base_durs = base_durs + [clip_duration] * (nframes - len(base_durs))
+    else:
+        base_durs = base_durs[:nframes]
+    base_durs = [b if b > 0.3 else clip_duration for b in base_durs]
+
+    # 每片段目标时长：
+    #   auto_duration=True  -> 以“基准时长”为下限，随解说词长度自动延长
+    #                          （旁白结束后再留 tail_pad 秒空镜），上限 max_clip_duration。
+    #   auto_duration=False -> 固定为“基准时长”（旁白过长会被加速，行为同旧版）。
+    if auto_duration:
+        clip_durations = []
+        for i, d in enumerate(raw_durs):
+            mn = base_durs[i]
+            if d <= 0.15:                     # 空旁白：用基准（最短）时长
+                clip_durations.append(mn)
+            else:
+                clip_durations.append(min(max_clip_duration, max(mn, d + tail_pad)))
+    else:
+        clip_durations = list(base_durs)
+
+    # Step 5: 静音视频（按每片段时长）
+    if progress_cb:
+        progress_cb("video", 0.7, "编码静音视频")
+    video_path = create_silent_video(title_path, frame_paths, title_duration,
+                                      clip_durations, video_dir, Wd, Ht, progress_cb)
+    if not video_path:
+        return None
+
+    # Step 6: 拼装音轨（按每片段时长）
+    if progress_cb:
+        progress_cb("tts", 0.85, "拼装旁白音轨")
+    final_audio = assemble_audio(wavs, clip_durations, title_duration,
+                                 narration_dir, progress_cb)
+    if not final_audio:
+        return None
+
+    # 字幕：由旁白 + 每片段时长生成 SRT（可选）
+    subtitle_mode = params.get("subtitle_mode", "none")   # none | srt | burn
+    srt_path = os.path.splitext(out_path)[0] + ".srt"
+    if subtitle_mode in ("srt", "burn"):
+        if progress_cb:
+            progress_cb("merge", 0.93, "生成字幕(SRT)")
+        srt_text = build_srt(narration, clip_durations, raw_durs, title_duration)
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_text)
+
+    # Step 7: 合成
+    if progress_cb:
+        progress_cb("merge", 0.95, "合成最终视频")
+    # 若要烧录字幕，先合成到临时文件，再重编码烧字幕到 out_path
+    mux_out = out_path if subtitle_mode != "burn" else os.path.join(workdir, "muxed.mp4")
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", final_audio,
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+           "-map", "0:v", "-map", "1:a",
+           # +faststart 把 moov 头移到文件开头：否则很多本地播放器打开“下载后的”文件会报格式错
+           "-movflags", "+faststart",
+           "-t", str(title_duration + sum(clip_durations)), mux_out]
+    if not run_ffmpeg(cmd, "merge"):
+        return None
+
+    if subtitle_mode == "burn":
+        if progress_cb:
+            progress_cb("merge", 0.97, "烧录字幕进画面")
+        font_dir = os.path.dirname(font_path) if font_path else os.path.dirname(os.path.abspath(__file__))
+        ok = burn_subtitles(mux_out, srt_path, out_path, font_dir, "STKaiti", Ht)
+        if not ok:
+            # 烧录失败（如字体/滤镜问题）不整体失败：退回未烧录版本 + 保留 SRT
+            import shutil
+            shutil.copy(mux_out, out_path)
+            print("  警告：字幕烧录失败，已输出无硬字幕的视频，另存了 .srt 文件。")
+
+    if progress_cb:
+        progress_cb("done", 1.0, "完成")
+    return out_path
+
+
+if __name__ == "__main__":
+    # 简单命令行测试
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pdf")
+    ap.add_argument("out")
+    ap.add_argument("--pages_per_clip", type=int, default=2)
+    ap.add_argument("--clip_duration", type=float, default=12.0)
+    ap.add_argument("--title", default="大众电影")
+    ap.add_argument("--subtitle", default="")
+    ap.add_argument("--voice", default="zh-CN-YunxiNeural")
+    ap.add_argument("--rate", default="+6%")
+    ap.add_argument("--font", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "font.ttf"))
+    args = ap.parse_args()
+    pages = extract_page_texts(args.pdf, use_ocr=True,
+                               py_exe=sys.executable,
+                               ocr_worker=os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ocr_worker.py"))
+    clips = group_into_clips(pages, args.pages_per_clip)
+    print(f"clips={len(clips)}")
+    build_video(args.pdf, args.out, vars(args), clips)

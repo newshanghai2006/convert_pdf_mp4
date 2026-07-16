@@ -1,0 +1,348 @@
+# -*- coding: utf-8 -*-
+"""前端页面 HTML (字符串)，由 app.py 引用为 INDEX_HTML。"""
+
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF 解说视频生成器</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:#1b1410; color:#eee; }
+  .wrap { max-width:860px; margin:0 auto; padding:24px 18px 60px; }
+  h1 { font-size:24px; color:#ffd28a; margin:0 0 4px; }
+  .sub { color:#b8a98f; font-size:13px; margin-bottom:20px; }
+  .card { background:#2a2018; border:1px solid #433426; border-radius:12px;
+          padding:18px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin:0 0 14px; color:#e8c89a; letter-spacing:1px; }
+  label { display:block; font-size:13px; color:#cbb79a; margin:10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width:100%; background:#1c150f; border:1px solid #4a3a2a; color:#eee;
+    border-radius:8px; padding:9px 10px; font-size:14px; font-family:inherit; }
+  textarea { resize:vertical; line-height:1.7; }
+  .seg-nar textarea { min-height:110px; font-size:15px; padding:10px 12px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:140px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
+  button { cursor:pointer; border:none; border-radius:9px; font-size:14px;
+           font-weight:600; padding:11px 18px; transition:.15s; }
+  .btn-main { background:linear-gradient(135deg,#e0a44a,#c8762e); color:#241606; }
+  .btn-main:hover { filter:brightness(1.08); }
+  .btn-2 { background:#3a2c1e; color:#e8c89a; border:1px solid #5a4632; }
+  .btn-2:disabled { opacity:.4; cursor:not-allowed; }
+  .btn-row { display:flex; gap:12px; margin-top:6px; }
+  .hint { font-size:12px; color:#8c7c63; margin-top:4px; }
+  #drop { border:2px dashed #5a4632; border-radius:12px; padding:26px; text-align:center;
+          color:#b8a98f; cursor:pointer; transition:.15s; }
+  #drop.hover { border-color:#e0a44a; background:#2e2218; color:#ffd28a; }
+  #file-name { color:#e8c89a; font-size:13px; margin-top:8px; }
+  .bar { height:10px; background:#1c150f; border-radius:6px; overflow:hidden; margin-top:8px;
+         border:1px solid #4a3a2a; }
+  .bar > i { display:block; height:100%; width:0; background:linear-gradient(90deg,#e0a44a,#c8762e);
+             transition:width .3s; }
+  #status { font-size:13px; color:#cbb79a; margin-top:8px; min-height:18px; }
+  .seg-nar { border:1px solid #3a2c1e; border-radius:8px; padding:8px 10px; margin-bottom:8px;
+             background:#211910; }
+  .seg-nar b { color:#e0a44a; font-size:12px; }
+  #video-preview { width:100%; border-radius:10px; margin-top:10px; background:#000; display:none; }
+  .pill { display:inline-block; background:#3a2c1e; color:#e8c89a; border-radius:20px;
+          padding:3px 12px; font-size:12px; margin-left:8px; }
+  .ok { color:#7ed18a; }
+  .err { color:#e88a7a; }
+  a.dl { color:#ffd28a; text-decoration:none; font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>PDF 解说视频生成器</h1>
+  <div class="sub">上传《大众电影》式 PDF → 自动提取文字 → 编辑旁白 → 生成 MP4。封面+标题卡自动生成。</div>
+
+  <!-- 1. 上传 + 参数 -->
+  <div class="card">
+    <h2>① 选择 PDF 与基本参数</h2>
+    <div id="drop">点击或拖拽 PDF 文件到此处
+      <div id="file-name"></div>
+    </div>
+    <input type="file" id="pdf" accept="application/pdf" hidden>
+
+    <div class="grid3" style="margin-top:14px;">
+      <div><label>每片段时长(秒)</label>
+        <input type="number" id="clip_duration" value="12" min="2" max="120" step="0.5">
+        <div class="hint" id="clip_dur_hint">每个内容片段播放秒数</div></div>
+      <div><label>每片段页数</label>
+        <input type="number" id="pages_per_clip" value="2" min="1" max="8">
+        <div class="hint">几页 PDF 拼成 1 个视频片段</div></div>
+      <div><label>封面时长(秒)</label>
+        <input type="number" id="title_duration" value="3" min="0" max="15" step="0.5"></div>
+    </div>
+
+    <div class="grid3" style="margin-top:8px; align-items:end;">
+      <div>
+        <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;">
+          <input type="checkbox" id="auto_duration"> 按解说词自动延长片段时长</label>
+        <div class="hint">开启后「每片段时长」变为<b>最短</b>时长，旁白读完为止</div>
+      </div>
+      <div><label>片段最长时长(秒)</label>
+        <input type="number" id="max_clip_duration" value="60" min="5" max="300" step="1"></div>
+      <div><label>读完后留白(秒)</label>
+        <input type="number" id="tail_pad" value="1" min="0" max="10" step="0.5"></div>
+    </div>
+
+    <div style="margin-top:10px;">
+      <label>选择参与制作的页码（可选）</label>
+      <input type="text" id="page_range" placeholder="如 1~10,15~20,30；留空 = 全部页">
+      <div class="hint">只用这些页参与制作；支持 <b>~</b> 或 <b>-</b> 表示范围、逗号分隔，按填写顺序排列</div>
+    </div>
+
+    <div class="btn-row" style="flex-wrap:wrap;">
+      <button class="btn-main" id="btn-prepare">载入并提取文字</button>
+      <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
+        <input type="checkbox" id="use_ocr" checked> 纯图片PDF启用OCR(更慢)</label>
+      <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
+        识别语言
+        <select id="ocr_lang" style="width:auto;padding:6px 8px;">
+          <option value="ch_sim" selected>简体中文 + 英文</option>
+          <option value="ch_tra">繁体中文 + 英文</option>
+        </select>
+      </label>
+    </div>
+    <div class="hint">繁体材料请选「繁体中文」（简繁模型不同，不能混识别；首次用繁体需联网下载繁体模型）。</div>
+    <div class="bar"><i id="bar1"></i></div>
+    <div id="status1"></div>
+  </div>
+
+  <!-- 2. 旁白编辑 -->
+  <div class="card" id="card-nar" style="display:none;">
+    <h2>② 编辑旁白 <span class="pill" id="clip-pill">0 段</span></h2>
+    <div class="hint" style="margin-bottom:10px;">每块 = 一个视频片段：左侧改旁白，右上「时长(秒)」可单独设置该片段时长（默认同步①里的每片段时长；开了「自动延长」则此值作为该片段的<b>最短</b>时长）。</div>
+    <div id="nar-list"></div>
+  </div>
+
+  <!-- 3. 标题与声音 -->
+  <div class="card" id="card-opt" style="display:none;">
+    <h2>③ 标题卡与配音设置</h2>
+    <div class="grid2">
+      <div><label>主标题</label><input type="text" id="title" value="大众电影"></div>
+      <div><label>副标题(期号)</label><input type="text" id="subtitle" placeholder="如 1989年第11期 · 总第437期"></div>
+      <div><label>徽标文字</label><input type="text" id="feature" placeholder="如 封面 青年演员 何晴"></div>
+      <div><label>副信息1</label><input type="text" id="feature2" placeholder="如 首届中国电影节"></div>
+      <div><label>副信息2</label><input type="text" id="feature3" placeholder="如 《开国大典》《本命年》"></div>
+      <div><label>标语</label><input type="text" id="tagline" value="怀旧时光之旅"></div>
+    </div>
+    <div class="grid2" style="margin-top:8px;">
+      <div><label>配音声音</label><select id="voice"></select></div>
+      <div><label>语速</label><select id="rate"></select></div>
+    </div>
+
+    <div class="grid3" style="margin-top:8px; align-items:end;">
+      <div><label>画面比例</label>
+        <select id="aspect">
+          <option value="16:9" selected>16:9（横屏）</option>
+          <option value="9:16">9:16（竖屏/手机）</option>
+          <option value="4:3">4:3</option>
+          <option value="1:1">1:1（方形）</option>
+          <option value="custom">自定义…</option>
+        </select></div>
+      <div id="custom-ar" style="display:none;"><label>自定义比例(宽:高)</label>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <input type="number" id="custom_w" value="16" min="1" max="100" step="1" style="width:70px;">
+          <span style="color:#cbb79a;">:</span>
+          <input type="number" id="custom_h" value="9" min="1" max="100" step="1" style="width:70px;"></div></div>
+      <div><label>清晰度(短边)</label>
+        <select id="quality">
+          <option value="1080" selected>1080（高清）</option>
+          <option value="720">720（较高）</option>
+          <option value="480">480（标清·更快）</option>
+          <option value="1440">1440（更高·更慢）</option>
+        </select></div>
+    </div>
+    <div class="hint" id="dim-hint">输出尺寸：1920 × 1080</div>
+
+    <div class="grid2" style="margin-top:8px;">
+      <div><label>字幕</label>
+        <select id="subtitle_mode">
+          <option value="none" selected>不生成字幕</option>
+          <option value="srt">生成 SRT 字幕文件（随视频单独下载）</option>
+          <option value="burn">把字幕烧进画面（硬字幕，始终显示）</option>
+        </select>
+        <div class="hint">字幕内容取自「编辑旁白」；烧录为硬字幕需重新编码，稍慢。</div>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn-main" id="btn-generate">生成视频</button>
+    </div>
+    <div class="bar"><i id="bar2"></i></div>
+    <div id="status2"></div>
+  </div>
+
+  <!-- 4. 结果 -->
+  <div class="card" id="card-out" style="display:none;">
+    <h2>④ 成品</h2>
+    <video id="video-preview" controls></video>
+    <div id="out-links" style="margin-top:10px;"></div>
+  </div>
+</div>
+
+<script>
+let TASK_ID = null;
+
+const $ = id => document.getElementById(id);
+
+// 填充声音/语速
+fetch('/api/voices').then(r=>r.json()).then(d=>{
+  d.voices.forEach(v=>{ const o=document.createElement('option'); o.value=v[0]; o.textContent=v[1]; $('voice').appendChild(o); });
+  d.rates.forEach(r=>{ const o=document.createElement('option'); o.value=r; o.textContent=r; if(r==='+6%')o.selected=true; $('rate').appendChild(o); });
+});
+
+// 文件选择
+const drop=$('drop'), fileInput=$('pdf');
+drop.onclick=()=>fileInput.click();
+['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('hover');}));
+['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('hover');}));
+drop.addEventListener('drop',ev=>{ if(ev.dataTransfer.files[0]) setFile(ev.dataTransfer.files[0]); });
+fileInput.onchange=()=>{ if(fileInput.files[0]) setFile(fileInput.files[0]); };
+function setFile(f){ $('file-name').textContent='已选: '+f.name; window._file=f; }
+
+// 自动时长开关：切换「每片段时长」的提示文案
+$('auto_duration').addEventListener('change', e=>{
+  $('clip_dur_hint').innerHTML = e.target.checked
+    ? '此值为<b>最短</b>时长，旁白读完自动延长' : '每个内容片段播放秒数';
+});
+
+// 画面比例 / 清晰度：切换自定义输入 + 实时显示输出尺寸
+function even(x){ x=Math.round(x); return x%2? x+1 : x; }
+function calcDim(){
+  const asp=$('aspect').value; let aw=16, ah=9;
+  if(asp==='custom'){ aw=+$('custom_w').value||16; ah=+$('custom_h').value||9; }
+  else { const p=asp.split(':'); aw=+p[0]; ah=+p[1]; }
+  let q=Math.max(160,Math.min(2160,+$('quality').value||1080)), w,h;
+  if(aw>=ah){ h=q; w=q*aw/ah; } else { w=q; h=q*ah/aw; }
+  w=even(w); h=even(h);
+  if(Math.max(w,h)>3840){ const s=3840/Math.max(w,h); w=even(w*s); h=even(h*s); }
+  return [w,h];
+}
+function updateDimHint(){
+  $('custom-ar').style.display = $('aspect').value==='custom' ? '' : 'none';
+  const [w,h]=calcDim();
+  $('dim-hint').textContent='输出尺寸：'+w+' × '+h+(h>w?'（竖屏）':(w>h?'（横屏）':'（方形）'));
+}
+['aspect','quality','custom_w','custom_h'].forEach(id=>{
+  const el=$(id); if(el) el.addEventListener('change',updateDimHint);
+  if(el) el.addEventListener('input',updateDimHint);
+});
+updateDimHint();
+
+// 载入并提取
+$('btn-prepare').onclick=()=>{
+  if(!window._file){ alert('请先选择 PDF 文件'); return; }
+  const fd=new FormData();
+  fd.append('pdf', window._file);
+  fd.append('pages_per_clip', $('pages_per_clip').value);
+  fd.append('use_ocr', $('use_ocr').checked ? 'true':'false');
+  fd.append('page_range', $('page_range').value);
+  fd.append('ocr_lang', $('ocr_lang').value);
+  $('status1').textContent='上传中…';
+  fetch('/api/prepare',{method:'POST',body:fd}).then(r=>r.json()).then(j=>{
+    if(j.error){ $('status1').textContent=j.error; return; }
+    TASK_ID=j.task_id;
+    pollPrepare();
+  });
+};
+
+function pollPrepare(){
+  fetch('/api/status?task='+TASK_ID).then(r=>r.json()).then(st=>{
+    const pct=Math.round((st.progress||0)*100);
+    $('bar1').style.width=pct+'%';
+    $('status1').textContent=st.message||'';
+    if(st.stage==='ready'){
+      renderNarration(st.narration);
+      $('card-nar').style.display='block';
+      $('card-opt').style.display='block';
+      $('status1').innerHTML='<span class="ok">文字提取完成！可编辑旁白后点“生成视频”。</span>';
+      return;
+    }
+    if(st.stage==='error'){ $('status1').innerHTML='<span class="err">'+st.message+'</span>'; return; }
+    setTimeout(pollPrepare, 1000);
+  });
+}
+
+function renderNarration(arr){
+  $('clip-pill').textContent=arr.length+' 段';
+  const list=$('nar-list'); list.innerHTML='';
+  const gdur=$('clip_duration').value;
+  arr.forEach((t,i)=>{
+    const d=document.createElement('div'); d.className='seg-nar';
+    const head=document.createElement('div');
+    head.style.cssText='display:flex;justify-content:space-between;align-items:center;';
+    head.innerHTML='<b>片段 '+(i+1)+'</b>';
+    const durWrap=document.createElement('label');
+    durWrap.style.cssText='margin:0;font-size:12px;color:#cbb79a;display:flex;align-items:center;gap:5px;';
+    durWrap.innerHTML='时长(秒)';
+    const di=document.createElement('input');
+    di.type='number'; di.min='0.5'; di.step='0.5'; di.className='seg-dur'; di.value=gdur;
+    di.style.cssText='width:74px;padding:5px 7px;';
+    durWrap.appendChild(di); head.appendChild(durWrap);
+    d.appendChild(head);
+    const ta=document.createElement('textarea'); ta.rows=5; ta.value=t; ta.dataset.idx=i;
+    ta.style.marginTop='6px';
+    d.appendChild(ta); list.appendChild(d);
+  });
+}
+
+// 全局「每片段时长」改动时，同步刷新各片段的时长框
+$('clip_duration').addEventListener('input',()=>{
+  document.querySelectorAll('#nar-list .seg-dur').forEach(el=>{ el.value=$('clip_duration').value; });
+});
+
+// 生成视频
+$('btn-generate').onclick=()=>{
+  const narration=[...document.querySelectorAll('#nar-list textarea')].map(t=>t.value);
+  const clip_durations=[...document.querySelectorAll('#nar-list .seg-dur')].map(t=>+t.value||+$('clip_duration').value);
+  const payload={
+    task_id:TASK_ID, narration, clip_durations,
+    pages_per_clip:$('pages_per_clip').value,
+    clip_duration:$('clip_duration').value,
+    title_duration:$('title_duration').value,
+    auto_duration:$('auto_duration').checked,
+    max_clip_duration:$('max_clip_duration').value,
+    tail_pad:$('tail_pad').value,
+    aspect:$('aspect').value,
+    custom_w:$('custom_w').value, custom_h:$('custom_h').value,
+    quality:$('quality').value,
+    subtitle_mode:$('subtitle_mode').value,
+    title:$('title').value, subtitle:$('subtitle').value,
+    feature:$('feature').value, feature2:$('feature2').value,
+    feature3:$('feature3').value, tagline:$('tagline').value,
+    voice:$('voice').value, rate:$('rate').value,
+  };
+  $('status2').textContent='提交中…';
+  fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(r=>r.json()).then(()=>pollGen());
+};
+
+function pollGen(){
+  fetch('/api/status?task='+TASK_ID).then(r=>r.json()).then(st=>{
+    const pct=Math.round((st.progress||0)*100);
+    $('bar2').style.width=pct+'%';
+    $('status2').textContent=st.message||'';
+    if(st.stage==='done'){
+      $('card-out').style.display='block';
+      const v=$('video-preview'); v.src='/api/download/'+TASK_ID+'?t='+Date.now(); v.style.display='block';
+      let links='<a class="dl" href="/api/download/'+TASK_ID+'">⬇ 下载 MP4</a>';
+      if(st.srt_ready){ links+='&nbsp;&nbsp;<a class="dl" href="/api/download_srt/'+TASK_ID+'">⬇ 下载 SRT 字幕</a>'; }
+      $('out-links').innerHTML=links;
+      $('status2').innerHTML='<span class="ok">完成！可预览/下载。</span>';
+      return;
+    }
+    if(st.stage==='error'){ $('status2').innerHTML='<span class="err">'+st.message+'</span>'; return; }
+    setTimeout(pollGen, 1000);
+  });
+}
+</script>
+</body>
+</html>
+"""

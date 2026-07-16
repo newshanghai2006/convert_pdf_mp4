@@ -1,0 +1,68 @@
+# ===================== PDF 解说视频生成器 .gitignore =====================
+# 说明：这里列出「不需要上传到源码仓库」的文件/目录。
+# 需要上传的源码：app.py / pipeline.py / index_html.py / _ocr_worker.py /
+#                _selftest.py / README_解说视频生成器.md / fonts.conf / stop.bat
+
+# ---- 运行时产物（每次任务生成，体积大且无需版本管理）----
+# tasks/ 下是：上传的 PDF、抽出的页面图/帧、临时音频、OCR 结果、成品 MP4/SRT 等
+tasks/
+# 保留空的 tasks/ 目录结构（可选）：取消下面两行注释即可
+# !tasks/
+# !tasks/.gitkeep
+
+# OCR / 生成过程中的中间文件（正常都在 tasks/ 里，这里再兜底一层）
+ocr.txt
+*.srt
+output.mp4
+*_work/
+subfont.ttf
+_ocr_tmp_*.jpg
+ocr_*.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 环境/密钥 ----
+.env
+.env.*
+*.local
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 日志 ----
+*.log
+
+# ===================== 大文件 / 需自行决定 =====================
+# font.ttf 是运行必需的中文字体（华文楷体 STKaiti），未被忽略、会上传。
+#   注意：楷体为商业字体，公开仓库上传可能有版权风险——若介意，
+#   可在此加入一行  font.ttf  忽略它，并在 README 里改为让用户自备同名字体。
+
+# sample/ 里的演示素材较大（sample_in.pdf ≈ 41MB、sample_out.mp4 ≈ 35MB）。
+# 默认忽略，保持仓库轻量；若想在 GitHub 上保留演示效果，删掉下面两行即可。
+sample/*.pdf
+sample/*.mp4
