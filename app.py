@@ -21,7 +21,6 @@ import threading
 from flask import Flask, request, jsonify, send_file, Response
 from werkzeug.utils import secure_filename
 
-import pipeline
 from index_html import INDEX_HTML
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +30,11 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "tasks")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
+
+
+def _pipeline():
+    import pipeline
+    return pipeline
 
 VOICES = [
     ("zh-CN-YunxiNeural", "云希（男声）"),
@@ -55,26 +59,44 @@ def update_task(tid, **kw):
 # ---------------------------------------------------------------------------
 # 后台：提取文字
 # ---------------------------------------------------------------------------
-def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim"):
+def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
+               page_range=""):
     def cb(stage, pct, msg):
         update_task(tid, stage=stage, progress=pct, message=msg)
 
     try:
-        pages = pipeline.extract_page_texts(
+        llm_cfg = TASKS[tid].get("llm_cfg") or {}
+        probe_ocr = bool(llm_cfg.get("enabled"))
+        p = _pipeline()
+        if page_range:
+            cb("extract", 0.01, "正在解析页码选择")
+            sel_path = os.path.join(os.path.dirname(pdf_path), "input_sel.pdf")
+            pdf_path, n_sel = p.make_working_pdf(pdf_path, sel_path, page_range)
+            update_task(tid, pdf_path=pdf_path)
+            if n_sel:
+                cb("extract", 0.03, f"页码选择完成，共 {n_sel} 页")
+        pages = p.extract_page_texts(
             pdf_path, use_ocr=use_ocr, progress_cb=cb,
             ocr_worker=OCR_WORKER, py_exe=__import__("sys").executable,
-            ocr_lang=ocr_lang)
-        clips = pipeline.group_into_clips(pages, pages_per_clip)
+            ocr_lang=ocr_lang, probe_ocr=probe_ocr)
+        clips = p.group_into_clips(pages, pages_per_clip)
+        ai_note = ""
+        if llm_cfg.get("enabled"):
+            clips, ai_note = p.generate_ai_narration(
+                pages, pages_per_clip, clips, llm_cfg, cb)
+        ready_msg = "\u6587\u5b57\u63d0\u53d6\u5b8c\u6210\uff0c\u53ef\u7f16\u8f91\u65c1\u767d\u540e\u751f\u6210"
+        if llm_cfg.get("enabled"):
+            ready_msg = f"\u6587\u5b57\u63d0\u53d6\u5b8c\u6210\uff0c{ai_note or 'AI \u65c1\u767d\u5df2\u751f\u6210'}\uff0c\u53ef\u7f16\u8f91\u540e\u751f\u6210\u89c6\u9891"
         update_task(tid, stage="ready", progress=1.0,
-                    message="文字提取完成，可编辑旁白后生成",
+                    message=ready_msg,
                     narration=clips, clips=len(clips),
                     page_count=len(pages))
     except Exception as e:
-        update_task(tid, stage="error", message=f"提取失败: {e}")
+        update_task(tid, stage="error", message=f"\u63d0\u53d6\u5931\u8d25: {e}")
 
 
 # ---------------------------------------------------------------------------
-# 后台：生成视频
+# \u540e\u53f0\uff1a\u751f\u6210\u89c6\u9891
 # ---------------------------------------------------------------------------
 def do_generate(tid, pdf_path, params, narration):
     def cb(stage, pct, msg):
@@ -83,7 +105,7 @@ def do_generate(tid, pdf_path, params, narration):
     try:
         params["font_path"] = FONT_PATH
         out_path = TASKS[tid]["output_path"]
-        res = pipeline.build_video(pdf_path, out_path, params, narration, cb)
+        res = _pipeline().build_video(pdf_path, out_path, params, narration, cb)
         if res:
             srt_path = os.path.splitext(out_path)[0] + ".srt"
             srt_ready = (params.get("subtitle_mode") in ("srt", "burn")
@@ -119,6 +141,16 @@ def api_prepare():
         return jsonify({"error": "empty"}), 400
     pages_per_clip = int(request.form.get("pages_per_clip", 2))
     use_ocr = request.form.get("use_ocr", "true").lower() == "true"
+    use_ai_narration = request.form.get("use_ai_narration", "false").lower() == "true"
+    if use_ai_narration:
+        use_ocr = True
+    llm_cfg = {
+        "enabled": use_ai_narration,
+        "provider": request.form.get("llm_provider", "openai").strip().lower(),
+        "base_url": request.form.get("llm_base_url", "").strip(),
+        "api_key": request.form.get("llm_api_key", "").strip(),
+        "model": request.form.get("llm_model", "").strip(),
+    }
     page_range = request.form.get("page_range", "").strip()
     ocr_lang = request.form.get("ocr_lang", "ch_sim").strip()
     if ocr_lang not in ("ch_sim", "ch_tra"):
@@ -132,27 +164,19 @@ def api_prepare():
     f.save(pdf_path)
     out_path = os.path.join(work, "output.mp4")
 
-    # 页码选择：把选中的页抽成子 PDF，后续全流程都基于它
-    sel_msg = ""
-    try:
-        sel_path = os.path.join(work, "input_sel.pdf")
-        work_pdf, n_sel = pipeline.make_working_pdf(pdf_path, sel_path, page_range)
-        pdf_path = work_pdf
-        if page_range:
-            sel_msg = f"（已按页码选择 {n_sel} 页）"
-    except Exception as e:
-        return jsonify({"error": f"页码选择解析失败: {e}"}), 400
-
     with TASKS_LOCK:
         TASKS[tid] = {
             "stage": "preparing", "progress": 0.0,
-            "message": "开始提取文字" + sel_msg, "pdf_path": pdf_path,
+            "message": "\u6b63\u5728\u89e3\u6790\u9875\u7801\u9009\u62e9" if page_range else "\u5f00\u59cb\u63d0\u53d6\u6587\u5b57",
+            "pdf_path": pdf_path,
             "output_path": out_path, "output_ready": False,
             "narration": [], "clips": 0, "page_count": 0,
             "srt_ready": False, "srt_path": "",
+            "llm_cfg": llm_cfg,
+            "page_range": page_range,
         }
     t = threading.Thread(target=do_prepare,
-                         args=(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang))
+                         args=(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang, page_range))
     t.daemon = True
     t.start()
     return jsonify({"task_id": tid})
@@ -165,7 +189,7 @@ def api_status():
         st = TASKS.get(tid)
         if not st:
             return jsonify({"error": "not found"}), 404
-        # 复制可序列化字段（去掉大对象）
+        # \u590d\u5236\u53ef\u5e8f\u5217\u5316\u5b57\u6bb5\uff08\u53bb\u6389\u5927\u5bf9\u8c61\uff09
         return jsonify({
             "stage": st["stage"], "progress": st["progress"],
             "message": st["message"], "clips": st["clips"],
@@ -174,6 +198,24 @@ def api_status():
             "output_ready": st["output_ready"],
             "srt_ready": st.get("srt_ready", False),
         })
+
+
+@app.route("/api/save_narration", methods=["POST"])
+def api_save_narration():
+    data = request.get_json(force=True)
+    tid = data.get("task_id")
+    idx = int(data.get("idx", -1))
+    text = data.get("text", "")
+    with TASKS_LOCK:
+        st = TASKS.get(tid)
+        if not st:
+            return jsonify({"error": "not found"}), 404
+        narration = st.get("narration", [])
+        if idx < 0 or idx >= len(narration):
+            return jsonify({"error": "bad idx"}), 400
+        narration[idx] = text
+        st["narration"] = narration
+    return jsonify({"ok": True})
 
 
 @app.route("/api/generate", methods=["POST"])
@@ -188,8 +230,8 @@ def api_generate():
             return jsonify({"error": "not ready"}), 400
         pdf_path = st["pdf_path"]
         out_path = st["output_path"]
+        narration = list(st.get("narration", []))
 
-    narration = data.get("narration", [])
     try:
         clip_durs = [float(x) for x in (data.get("clip_durations") or [])]
     except Exception:
@@ -250,23 +292,19 @@ def api_download_srt(tid):
 def _preflight():
     """启动前自检：打印关键依赖状态，避免“运行无显示”一头雾水。"""
     import shutil
+    import importlib.util
     print("=" * 50, flush=True)
     print("PDF 解说视频生成器 启动自检", flush=True)
     ff = shutil.which("ffmpeg")
     print(f"  ffmpeg : {'OK ' + ff if ff else '缺失! 请安装 ffmpeg 并加入 PATH'}", flush=True)
     fp = shutil.which("ffprobe")
     print(f"  ffprobe: {'OK ' + fp if fp else '缺失! 请安装 ffmpeg(含 ffprobe)'}", flush=True)
-    for mod in ("flask", "fitz", "PIL", "edge_tts"):
+    for mod in ("flask", "fitz", "PIL", "edge_tts", "easyocr"):
         try:
-            __import__(mod)
-            print(f"  {mod:8s}: OK", flush=True)
+            ok = importlib.util.find_spec(mod) is not None
+            print(f"  {mod:8s}: {'OK' if ok else '未安装'}", flush=True)
         except Exception as e:
-            print(f"  {mod:8s}: 缺失! {e}", flush=True)
-    try:
-        __import__("easyocr")
-        print("  easyocr : OK（纯图片PDF的OCR可用）", flush=True)
-    except Exception:
-        print("  easyocr : 未安装（仅影响纯图片PDF的OCR，有文字层的PDF不受影响）", flush=True)
+            print(f"  {mod:8s}: 检查失败! {e}", flush=True)
     print("=" * 50, flush=True)
 
 

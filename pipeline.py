@@ -20,6 +20,8 @@ import time
 import math
 import asyncio
 import subprocess
+from urllib import request as urlrequest
+from urllib import error as urlerror
 
 import fitz
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -192,14 +194,52 @@ def make_working_pdf(src_path, out_path, spec):
 # 文字提取：文字层优先，否则 OCR (子进程分批，保护主进程)
 # ----------------------------------------------------------------------------
 def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
-                       ocr_worker=None, py_exe=None, ocr_lang="ch_sim"):
+                       ocr_worker=None, py_exe=None, ocr_lang="ch_sim",
+                       probe_ocr=False):
     """返回 list[str]，每页一段文字。文字层优先；若全空且 use_ocr，则跑 OCR。
     ocr_lang: 'ch_sim'(简体) 或 'ch_tra'(繁体)，均搭配英文。"""
     doc = fitz.open(pdf_path)
     N = doc.page_count
     pages = []
+
+    # probe_ocr=False 时走更接近原版的全量提取逻辑。
+    if use_ocr and probe_ocr:
+        probe_n = min(5, N)
+        probe = []
+        for i in range(probe_n):
+            probe.append(doc[i].get_text().strip())
+            if progress_cb:
+                progress_cb("extract", (i + 1) / max(1, probe_n),
+                            f"正在检查文字层 {i + 1}/{probe_n}")
+        has_text = any(p.strip() for p in probe)
+        if not has_text:
+            doc.close()
+            if progress_cb:
+                progress_cb("ocr", 0.0, "未检测到文字层，开始 OCR")
+            out_txt = os.path.join(os.path.dirname(pdf_path), "ocr.txt")
+            if os.path.exists(out_txt):
+                os.remove(out_txt)
+            ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe, ocr_lang)
+            return parse_ocr_txt(out_txt, N)
+
+        # 样本里有文字层，再做全量提取
+        if progress_cb:
+            progress_cb("extract", 0.1, "检测到文字层，正在完整提取")
+        doc.close()
+        doc = fitz.open(pdf_path)
+        for i in range(N):
+            pages.append(doc[i].get_text().strip())
+            if progress_cb and (i % max(1, N // 20) == 0 or i + 1 == N):
+                progress_cb("extract", 0.1 + 0.9 * (i + 1) / max(1, N),
+                            f"正在提取文字层 {i + 1}/{N}")
+        doc.close()
+        return pages
+
     for i in range(N):
         pages.append(doc[i].get_text().strip())
+        if progress_cb and (i % max(1, N // 20) == 0 or i + 1 == N):
+            progress_cb("extract", (i + 1) / max(1, N),
+                        f"正在提取文字层 {i + 1}/{N}")
     doc.close()
 
     has_text = any(p.strip() for p in pages)
@@ -212,6 +252,9 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
         if progress_cb:
             progress_cb("extract", 1.0, "未检测到文字层（纯图片），需启用 OCR")
         return pages
+
+    if progress_cb:
+        progress_cb("ocr", 0.0, "未检测到文字层，开始 OCR")
 
     # OCR 结果放在任务自己的目录下（不再用进程 PID 命名的公共临时文件，
     # 否则同一 Flask 进程里并发的两个任务会写到同一个文件、互相污染）。
@@ -242,6 +285,18 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
     stalls = 0
     last_err = ""
     err_log = out_txt + ".stderr.log"
+    ocr_profiles = [
+        {
+            "OCR_RENDER_ZOOM": str(150 / 72.0),
+            "OCR_CANVAS_SIZE": "1024",
+            "OCR_MAG_RATIO": "1.0",
+        },
+        {
+            "OCR_RENDER_ZOOM": str(120 / 72.0),
+            "OCR_CANVAS_SIZE": "896",
+            "OCR_MAG_RATIO": "1.0",
+        },
+    ]
     while True:
         done = count_ocr_pages(out_txt)
         if done >= N:
@@ -250,11 +305,14 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
         timeout = max(600, (N - done) * 120)
         deadline = time.time() + timeout
         # 用 Popen 非阻塞启动；stderr 落到日志文件，避免管道写满导致子进程卡死。
+        profile = ocr_profiles[min(stalls, len(ocr_profiles) - 1)]
+        env = os.environ.copy()
+        env.update(profile)
         try:
             ef = open(err_log, "w", encoding="utf-8", errors="replace")
             proc = subprocess.Popen(
                 [py_exe, ocr_worker, pdf_path, str(done), str(N), out_txt, ocr_lang],
-                stdout=subprocess.DEVNULL, stderr=ef, text=True)
+                stdout=subprocess.DEVNULL, stderr=ef, text=True, env=env)
         except Exception as e:
             last_err = f"无法启动 OCR 子进程: {e}"
             print("  " + last_err)
@@ -310,6 +368,8 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
         if not killed and rc not in (0, None):
             last_err = _summarize_err(_tail_file(err_log, 4000)) or \
                 f"worker 异常退出（returncode={rc}）"
+            if rc == 3221225477:
+                last_err = "worker 异常退出（0xC0000005，Windows 原生库崩溃）"
             print(f"  OCR worker exit {rc}: {last_err}")
 
         new_done = count_ocr_pages(out_txt)
@@ -661,6 +721,206 @@ def _write_silence(path, seconds=0.1):
     run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-t", str(seconds), "-ar", "44100", "-ac", "2",
                 "-c:a", "pcm_s16le", path], "silence")
+
+
+def _openai_chat_completions_url(base_url):
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("LLM base_url 不能为空")
+    if base.endswith("/chat/completions"):
+        return base
+    return base + "/chat/completions"
+
+
+def _call_openai_chat(base_url, api_key, model, messages, temperature=0.4,
+                      max_tokens=512, timeout=180):
+    url = _openai_chat_completions_url(base_url)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": int(max_tokens),
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+
+    req = urlrequest.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        raise RuntimeError(
+            f"LLM 请求失败: HTTP {e.code} {e.reason}"
+            + (f" | {body[-500:]}" if body else "")
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"LLM 请求失败: {e}") from e
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"LLM 返回不是合法 JSON: {e}; 原始内容: {raw[-500:]}") from e
+
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"LLM 返回错误: {data['error']}")
+
+    try:
+        choices = data["choices"]
+        msg = choices[0]["message"]
+        content = msg.get("content", "")
+    except Exception as e:
+        raise RuntimeError(f"LLM 返回缺少 choices/message.content: {e}") from e
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        content = "\n".join(parts)
+    return str(content).strip()
+
+
+def _clean_ai_text(text):
+    if not text:
+        return ""
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else ""
+        if s.endswith("```"):
+            s = s[:-3]
+    s = s.replace("\r", "\n").strip()
+    lines = [ln.strip("` ").strip() for ln in s.splitlines()]
+    lines = [ln for ln in lines if ln]
+    s = " ".join(lines).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" \t\r\n\"'。")
+
+
+def _is_retryable_llm_error(err_text):
+    s = (err_text or "").lower()
+    return any(k in s for k in (
+        "http 429", "too many requests", "rate limit",
+        "http 500", "http 502", "http 503", "http 504",
+        "temporarily unavailable", "timeout",
+    ))
+
+
+def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
+                          progress_cb=None):
+    """
+    Generate narration text for each clip via an OpenAI-compatible LLM.
+    NVIDIA mode is throttled to stay under the free-tier rpm limit.
+    """
+    enabled = bool(llm_cfg and llm_cfg.get("enabled"))
+    provider = (llm_cfg or {}).get("provider", "openai").strip().lower()
+    base_url = (llm_cfg or {}).get("base_url", "")
+    api_key = (llm_cfg or {}).get("api_key", "")
+    model = (llm_cfg or {}).get("model", "")
+    if not enabled:
+        return fallback_clips, ""
+    if not base_url or not model:
+        return fallback_clips, "AI 旁白配置不完整，已保留原始文本"
+
+    is_nvidia = provider == "nvidia"
+    min_interval = 1.65 if is_nvidia else 0.0
+    next_allowed_at = 0.0
+
+    clip_count = len(fallback_clips)
+    out = []
+    failures = 0
+    last_err = ""
+    for i in range(clip_count):
+        start = i * max(1, int(pages_per_clip))
+        end = min(len(page_texts), start + max(1, int(pages_per_clip)))
+        pages = page_texts[start:end]
+        if not pages:
+            out.append(fallback_clips[i])
+            failures += 1
+            continue
+
+        if is_nvidia:
+            wait = max(0.0, next_allowed_at - time.time())
+            if wait > 0:
+                if progress_cb:
+                    progress_cb("ai", 0.55 + 0.35 * i / max(1, clip_count),
+                                f"NVIDIA 模式节流等待 {wait:.1f}s")
+                time.sleep(wait)
+
+        parts = []
+        for j, text in enumerate(pages, start=start + 1):
+            label = "封面" if j == 1 else f"第{j}页"
+            txt = (text or "").strip()
+            if not txt:
+                txt = "（无可识别文字，主要为版面或图片）"
+            parts.append(f"{label}：{txt}")
+
+        sys_msg = (
+            "你是中文杂志解说视频的旁白编写助手。"
+            "请根据给定页面 OCR 文本写一段适合口播的旁白，语气自然、信息准确、简洁流畅。"
+            "如果第1页是封面，只把它当作封面参考，不要逐字复述封面标题。"
+            "只输出最终旁白正文，不要编号、标题、项目符号、解释或前后缀。"
+        )
+        user_msg = (
+            f"这是第 {i + 1}/{clip_count} 个片段。"
+            "请写 1 到 2 句中文旁白，长度大约 60 到 120 个汉字。"
+            "页面 OCR 如下：\n" + "\n".join(parts)
+        )
+
+        ok = False
+        for attempt in range(1, 4):
+            if is_nvidia:
+                next_allowed_at = max(next_allowed_at, time.time()) + min_interval
+            try:
+                raw = _call_openai_chat(
+                    base_url, api_key, model,
+                    [{"role": "system", "content": sys_msg},
+                     {"role": "user", "content": user_msg}],
+                    temperature=0.5,
+                    max_tokens=512,
+                    timeout=180,
+                )
+                text = _clean_ai_text(raw)
+                if not text:
+                    raise RuntimeError("LLM 返回内容为空")
+                out.append(text)
+                ok = True
+                break
+            except Exception as e:
+                last_err = str(e)
+                retryable = is_nvidia and _is_retryable_llm_error(last_err)
+                if retryable and attempt < 3:
+                    sleep_s = min(15.0, 1.7 * (2 ** (attempt - 1)))
+                    print(f"    AI 旁白 {i + 1}/{clip_count} 命中限流，{sleep_s:.1f}s 后重试: {e}")
+                    if progress_cb:
+                        progress_cb("ai", 0.55 + 0.35 * i / max(1, clip_count),
+                                    f"NVIDIA 限流，重试 {attempt + 1}/3")
+                    time.sleep(sleep_s)
+                    continue
+                failures += 1
+                print(f"    AI 旁白 {i + 1}/{clip_count} 失败，回退原文: {e}")
+                out.append(fallback_clips[i])
+                break
+
+        if progress_cb:
+            progress_cb("ai", 0.55 + 0.35 * (i + 1) / max(1, clip_count),
+                        f"AI 生成旁白 {i + 1}/{clip_count}")
+
+    if failures:
+        note = "AI 旁白已生成，但部分片段回退为原始文本"
+        if failures >= clip_count:
+            note = "AI 旁白生成失败，已保留原始 OCR 文本"
+            if last_err:
+                print(f"  AI 旁白最终失败: {last_err}")
+        return out, note
+    return out, ""
 
 
 def synth_narration(narration, narration_dir, voice, rate, progress_cb=None):

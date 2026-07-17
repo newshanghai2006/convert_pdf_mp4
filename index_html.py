@@ -97,6 +97,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="hint">只用这些页参与制作；支持 <b>~</b> 或 <b>-</b> 表示范围、逗号分隔，按填写顺序排列</div>
     </div>
 
+    <div style="margin-top:10px; padding:10px 12px; border:1px solid #3a2c1e; border-radius:8px; background:#211910;">
+      <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;margin:0;">
+        <input type="checkbox" id="use_ai_narration"> 使用AI自动生成旁白
+      </label>
+      <div id="ai-config" style="display:none; margin-top:10px;">
+        <div style="margin-bottom:8px;">
+          <label>LLM 类型</label>
+          <select id="llm_provider">
+            <option value="openai" selected>通用 OpenAI 兼容接口</option>
+            <option value="nvidia">NVIDIA 免费 API（限 40 rpm）</option>
+          </select>
+        </div>
+        <div class="grid3">
+          <div><label>LLM base_url</label><input type="text" id="llm_base_url" placeholder="https://api.openai.com/v1"></div>
+          <div><label>API Key</label><input type="password" id="llm_api_key" placeholder="sk-..."></div>
+          <div><label>Model</label><input type="text" id="llm_model" placeholder="gpt-4o-mini"></div>
+        </div>
+        <div class="hint" id="ai-provider-hint">开启后，系统会先根据每个片段的 OCR 文本生成旁白，再继续后面的配音流程。</div>
+      </div>
+    </div>
+
     <div class="btn-row" style="flex-wrap:wrap;">
       <button class="btn-main" id="btn-prepare">载入并提取文字</button>
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
@@ -191,6 +212,68 @@ INDEX_HTML = r"""<!DOCTYPE html>
 let TASK_ID = null;
 
 const $ = id => document.getElementById(id);
+const AI_CFG_KEY = 'mk_dzdy_ai_cfg_v1';
+
+function loadAiCfg(){
+  try { return JSON.parse(localStorage.getItem(AI_CFG_KEY) || '{}') || {}; }
+  catch(e){ return {}; }
+}
+function saveAiCfg(){
+  const data = {
+    use_ai_narration: $('use_ai_narration').checked,
+    llm_provider: $('llm_provider').value,
+    llm_base_url: $('llm_base_url').value,
+    llm_api_key: $('llm_api_key').value,
+    llm_model: $('llm_model').value,
+  };
+  try { localStorage.setItem(AI_CFG_KEY, JSON.stringify(data)); }
+  catch(e){}
+}
+const NARR_SAVE_TIMERS = {};
+function saveNarrationSegment(idx, text){
+  if(!TASK_ID) return;
+  fetch('/api/save_narration',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({task_id:TASK_ID, idx, text})
+  }).catch(()=>{});
+}
+function debounceSaveNarration(idx, text){
+  if(NARR_SAVE_TIMERS[idx]) clearTimeout(NARR_SAVE_TIMERS[idx]);
+  NARR_SAVE_TIMERS[idx] = setTimeout(()=>saveNarrationSegment(idx, text), 450);
+}
+function syncAiCfgUi(){
+  const on = $('use_ai_narration').checked;
+  const provider = $('llm_provider').value;
+  $('ai-config').style.display = on ? '' : 'none';
+  if (on) $('use_ocr').checked = true;
+  $('use_ocr').disabled = on;
+  ['llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
+    const el=$(id);
+    if(el) el.disabled = !on;
+  });
+  if (provider === 'nvidia') {
+    $('ai-provider-hint').textContent = 'NVIDIA 模式会自动节流，请把 base_url / API Key / model 填好后再生成。';
+  } else {
+    $('ai-provider-hint').textContent = '开启后，系统会先根据每个片段的 OCR 文本生成旁白，再继续后面的配音流程。';
+  }
+}
+
+const savedAiCfg = loadAiCfg();
+if (savedAiCfg) {
+  $('use_ai_narration').checked = !!savedAiCfg.use_ai_narration;
+  if (savedAiCfg.llm_provider !== undefined) $('llm_provider').value = savedAiCfg.llm_provider;
+  if (savedAiCfg.llm_base_url !== undefined) $('llm_base_url').value = savedAiCfg.llm_base_url;
+  if (savedAiCfg.llm_api_key !== undefined) $('llm_api_key').value = savedAiCfg.llm_api_key;
+  if (savedAiCfg.llm_model !== undefined) $('llm_model').value = savedAiCfg.llm_model;
+}
+syncAiCfgUi();
+['use_ai_narration','llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
+  const el=$(id);
+  if(!el) return;
+  el.addEventListener('change', ()=>{ syncAiCfgUi(); saveAiCfg(); });
+  el.addEventListener('input', saveAiCfg);
+});
 
 // 填充声音/语速
 fetch('/api/voices').then(r=>r.json()).then(d=>{
@@ -239,18 +322,29 @@ updateDimHint();
 // 载入并提取
 $('btn-prepare').onclick=()=>{
   if(!window._file){ alert('请先选择 PDF 文件'); return; }
+  saveAiCfg();
   const fd=new FormData();
   fd.append('pdf', window._file);
   fd.append('pages_per_clip', $('pages_per_clip').value);
   fd.append('use_ocr', $('use_ocr').checked ? 'true':'false');
+  fd.append('use_ai_narration', $('use_ai_narration').checked ? 'true':'false');
+  fd.append('llm_provider', $('llm_provider').value);
+  fd.append('llm_base_url', $('llm_base_url').value);
+  fd.append('llm_api_key', $('llm_api_key').value);
+  fd.append('llm_model', $('llm_model').value);
   fd.append('page_range', $('page_range').value);
   fd.append('ocr_lang', $('ocr_lang').value);
   $('status1').textContent='上传中…';
-  fetch('/api/prepare',{method:'POST',body:fd}).then(r=>r.json()).then(j=>{
-    if(j.error){ $('status1').textContent=j.error; return; }
-    TASK_ID=j.task_id;
-    pollPrepare();
-  });
+  fetch('/api/prepare',{method:'POST',body:fd})
+    .then(r=>r.json().then(j=>({ok:r.ok, j})))
+    .then(({ok, j})=>{
+      if(!ok || j.error){ $('status1').textContent=(j && j.error) ? j.error : '上传失败'; return; }
+      TASK_ID=j.task_id;
+      pollPrepare();
+    })
+    .catch(err=>{
+      $('status1').textContent='上传失败: '+(err && err.message ? err.message : err);
+    });
 };
 
 function pollPrepare(){
@@ -289,6 +383,7 @@ function renderNarration(arr){
     d.appendChild(head);
     const ta=document.createElement('textarea'); ta.rows=5; ta.value=t; ta.dataset.idx=i;
     ta.style.marginTop='6px';
+    ta.addEventListener('input', ()=>debounceSaveNarration(i, ta.value));
     d.appendChild(ta); list.appendChild(d);
   });
 }
@@ -300,10 +395,9 @@ $('clip_duration').addEventListener('input',()=>{
 
 // 生成视频
 $('btn-generate').onclick=()=>{
-  const narration=[...document.querySelectorAll('#nar-list textarea')].map(t=>t.value);
   const clip_durations=[...document.querySelectorAll('#nar-list .seg-dur')].map(t=>+t.value||+$('clip_duration').value);
   const payload={
-    task_id:TASK_ID, narration, clip_durations,
+    task_id:TASK_ID, clip_durations,
     pages_per_clip:$('pages_per_clip').value,
     clip_duration:$('clip_duration').value,
     title_duration:$('title_duration').value,

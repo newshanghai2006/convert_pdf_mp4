@@ -19,6 +19,13 @@ OCR worker：被 pipeline.ocr_pdf_subprocess 以子进程方式调用。
 import sys
 import os
 import re
+import gc
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
 import fitz
@@ -36,14 +43,14 @@ if LANG not in ("ch_sim", "ch_tra"):
     LANG = "ch_sim"
 
 # 渲染分辨率：越高越清晰但越慢、越费内存。
-RENDER_ZOOM = 150 / 72.0
+RENDER_ZOOM = float(os.getenv("OCR_RENDER_ZOOM", str(150 / 72.0)))
 # easyocr 内部会把长边缩放到 canvas_size。这是清晰度 / 内存 / 速度的关键权衡：
 #   - 太小（如旧版 800）：小字糊掉、识别很差。
 #   - 太大（如 2560）：在低内存机器上会 OOM 甚至段错误（单页可能要 ~1GB）。
 # 1024 在本机（内存偏紧）实测稳定且比 800 清晰。内存充裕的机器可上调到 1280/1600 提高精度；
 # 若出现 "not enough memory" 或段错误崩溃，请下调该值。
-CANVAS_SIZE = 1024
-MAG_RATIO = 1.0
+CANVAS_SIZE = int(os.getenv("OCR_CANVAS_SIZE", "1024"))
+MAG_RATIO = float(os.getenv("OCR_MAG_RATIO", "1.0"))
 
 doc = fitz.open(PDF)
 N = doc.page_count
@@ -65,7 +72,7 @@ _RECOG_FILE = {"ch_sim": "zh_sim_g2.pth", "ch_tra": "chinese.pth"}
 _NEED = ("craft_mlt_25k.pth", _RECOG_FILE.get(LANG, "zh_sim_g2.pth"))
 _HAVE_MODELS = all(os.path.exists(os.path.join(_MODEL_DIR, n)) for n in _NEED)
 
-reader = easyocr.Reader([LANG, 'en'], gpu=False, verbose=False,
+reader = easyocr.Reader([LANG, 'en'], gpu=False, verbose=False, quantize=False,
                         download_enabled=not _HAVE_MODELS)
 print(f"READER_READY lang={LANG}", flush=True)
 
@@ -79,11 +86,14 @@ with open(OUT, "a", encoding="utf-8") as f:
             im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             lines = reader.readtext(
                 np.array(im), detail=0, paragraph=False,
-                canvas_size=CANVAS_SIZE, mag_ratio=MAG_RATIO)
+                canvas_size=CANVAS_SIZE, mag_ratio=MAG_RATIO,
+                workers=0, batch_size=1)
         except Exception as e:  # 单页失败：写空页，保证进度前进
             lines = []
             print(f"PAGE_ERROR {i+1}: {e}", flush=True)
         f.write(f"========== PAGE {i+1} ==========\n" + "\n".join(lines) + "\n\n")
         f.flush()
+        del pix, im, lines
+        gc.collect()
         print(f"DONE {i+1}", flush=True)
 print("BATCH_OK", flush=True)
