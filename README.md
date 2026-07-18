@@ -1,6 +1,6 @@
-# PDF 解说视频生成器
+# AI PDF解说视频生成器
 
-把一本 PDF 杂志（尤其是《大众电影》这类扫描件）自动做成带旁白的解说视频（MP4）。
+把一本 PDF 杂志（尤其是《大众电影》这类扫描件）自动做成带 AI 旁白的解说视频（MP4）。
 本地运行的网页工具：**上传 PDF → 自动提取文字（无文字层则 OCR）→ 编辑旁白 → 调参数 → 一键生成**。封面标题卡、配音、字幕都自动搞定。
 
 > 详细中文文档见 **[README_解说视频生成器.md](README_解说视频生成器.md)**（安装、参数、OCR、常见问题一应俱全）。
@@ -10,8 +10,8 @@
 ## ✨ 功能
 
 - **PDF → 视频**：自动把每页渲染成画面，按「每片段 N 页」拼成片段，加封面标题卡，合成 MP4。
-- **文字提取**：有文字层的 PDF 秒级提取；纯扫描件用 **OCR**（EasyOCR，**简体 / 繁体**可选），子进程运行、断点续跑、卡死保护、实时进度。
-- **AI 配音**：微软 [edge-tts](https://github.com/rany2/edge-tts) 在线合成，6 种中文声线 + 语速可调；另可选 NVIDIA 免费 API 生成旁白，并自动节流；网络失败有清晰提示与降级。
+- **文字提取**：有文字层的 PDF 秒级提取；纯扫描件可选择 **EasyOCR / RapidOCR / PaddleOCR**，也可勾选支持视觉输入的 **AI OCR**；本地 OCR 子进程运行、断点续跑、卡死保护、实时进度。
+- **AI 配音**：微软 [edge-tts](https://github.com/rany2/edge-tts) 在线合成，6 种中文声线 + 语速可调；另可选 NVIDIA 免费 API 生成旁白，并自动节流；网络失败有清晰提示与降级。AI OCR 与 AI 旁白独立开关，共用 LLM 配置。
 - **旁白可编辑**：每段旁白单独编辑，也可**逐段单独设定时长**。
 - **按解说词自动延长片段时长**：旁白多长画面就停多久，不再把配音硬加速。
 - **选择页码**：只做其中某些页，如 `1~10,15~20,30`。
@@ -27,7 +27,7 @@
 
 - **Python 3.14**（用 `py -3.14`，或 `python`）
 - **ffmpeg**（含 `ffprobe`，需在 PATH）
-- Python 库：`flask` · `PyMuPDF` · `Pillow` · `edge-tts` · `numpy`，以及 OCR 需要的 `easyocr`（含 `torch`）
+- Python 库：`flask` · `PyMuPDF` · `Pillow` · `edge-tts` · `numpy`；本地 OCR 引擎按需安装 `easyocr`、`rapidocr_onnxruntime` 或 `paddleocr` / `paddlepaddle`
 - 联网要求：**配音**需能访问微软语音服务；**OCR 首次**需联网下载模型（之后离线）
 
 ---
@@ -40,7 +40,10 @@ winget install Gyan.FFmpeg          # 装完请重开终端使 PATH 生效
 
 # 2) 安装依赖
 py -3.14 -m pip install flask PyMuPDF Pillow edge-tts numpy
-py -3.14 -m pip install easyocr     # 仅纯图片/扫描 PDF 的 OCR 需要（体积较大）
+py -3.14 -m pip install easyocr     # 默认本地 OCR 引擎，可选
+# 也可以按需安装其它本地 OCR 引擎（二选一或都装）
+py -3.14 -m pip install rapidocr_onnxruntime
+py -3.14 -m pip install paddleocr paddlepaddle
 
 # 3) 启动
 py -3.14 app.py
@@ -54,7 +57,7 @@ py -3.14 app.py
 
 ## 🖱️ 使用（网页四步）
 
-1. **选 PDF + 基本参数**：每片段时长/页数、封面时长、（可选）页码选择、OCR 与识别语言。
+1. **选 PDF + 基本参数**：每片段时长/页数、封面时长、（可选）页码选择、OCR 引擎与识别语言；需要时勾选 AI OCR 并填写视觉模型配置。
 2. **载入并提取文字**：有文字层秒级；纯扫描件走 OCR，进度实时显示、可续跑。
 3. **编辑旁白**：逐段改解说词，逐段可设时长。
 4. **标题卡 + 配音 + 尺寸 + 字幕 → 生成**：填标题信息，选声音/语速、画面比例/清晰度、字幕方式，点「生成视频」，页内预览并下载 MP4（/SRT）。
@@ -68,7 +71,7 @@ mk_dzdy/
 ├── app.py                     # Flask 服务与接口（程序入口）
 ├── pipeline.py                # 生成管线：抽页 / 合帧 / 标题卡 / OCR / TTS / 字幕 / 合成
 ├── index_html.py              # 前端网页（上传、调参、编辑旁白、进度、下载）
-├── _ocr_worker.py             # OCR 子进程（简/繁，断点续跑）
+├── _ocr_worker.py             # OCR 子进程（Easy/Rapid/Paddle，简/繁，断点续跑）
 ├── _selftest.py               # 端到端自检脚本
 ├── fonts.conf / font.ttf      # 中文字体（楷体）
 ├── stop.bat                   # 停止服务的小脚本

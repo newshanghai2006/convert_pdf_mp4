@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-《大众电影》PDF -> 解说视频 本地 Web 应用。
+AI PDF解说视频生成器（《大众电影》式杂志）本地 Web 应用。
 运行: py -3.14 app.py  然后浏览器打开 http://127.0.0.1:5005
 
 功能:
@@ -60,13 +60,17 @@ def update_task(tid, **kw):
 # 后台：提取文字
 # ---------------------------------------------------------------------------
 def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
-               page_range=""):
+               page_range="", ai_ocr_cfg=None, ocr_engine="easyocr"):
     def cb(stage, pct, msg):
         update_task(tid, stage=stage, progress=pct, message=msg)
 
     try:
         llm_cfg = TASKS[tid].get("llm_cfg") or {}
-        probe_ocr = bool(llm_cfg.get("enabled"))
+        ai_ocr_cfg = ai_ocr_cfg or TASKS[tid].get("ai_ocr_cfg") or {}
+        # AI OCR has its own image path; keep the existing probe behavior for
+        # AI narration that still relies on the local OCR result.
+        probe_ocr = bool(llm_cfg.get("enabled") and
+                         not ai_ocr_cfg.get("enabled"))
         p = _pipeline()
         if page_range:
             cb("extract", 0.01, "正在解析页码选择")
@@ -78,7 +82,8 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
         pages = p.extract_page_texts(
             pdf_path, use_ocr=use_ocr, progress_cb=cb,
             ocr_worker=OCR_WORKER, py_exe=__import__("sys").executable,
-            ocr_lang=ocr_lang, probe_ocr=probe_ocr)
+            ocr_lang=ocr_lang, probe_ocr=probe_ocr, ai_ocr_cfg=ai_ocr_cfg,
+            ocr_engine=ocr_engine)
         clips = p.group_into_clips(pages, pages_per_clip)
         ai_note = ""
         if llm_cfg.get("enabled"):
@@ -142,19 +147,24 @@ def api_prepare():
     pages_per_clip = int(request.form.get("pages_per_clip", 2))
     use_ocr = request.form.get("use_ocr", "true").lower() == "true"
     use_ai_narration = request.form.get("use_ai_narration", "false").lower() == "true"
-    if use_ai_narration:
+    use_ai_ocr = request.form.get("use_ai_ocr", "false").lower() == "true"
+    if use_ai_narration or use_ai_ocr:
         use_ocr = True
-    llm_cfg = {
-        "enabled": use_ai_narration,
+    llm_common = {
         "provider": request.form.get("llm_provider", "openai").strip().lower(),
         "base_url": request.form.get("llm_base_url", "").strip(),
         "api_key": request.form.get("llm_api_key", "").strip(),
         "model": request.form.get("llm_model", "").strip(),
     }
+    llm_cfg = dict(llm_common, enabled=use_ai_narration)
+    ai_ocr_cfg = dict(llm_common, enabled=use_ai_ocr)
     page_range = request.form.get("page_range", "").strip()
     ocr_lang = request.form.get("ocr_lang", "ch_sim").strip()
     if ocr_lang not in ("ch_sim", "ch_tra"):
         ocr_lang = "ch_sim"
+    ocr_engine = request.form.get("ocr_engine", "easyocr").strip().lower()
+    if ocr_engine not in ("easyocr", "rapidocr", "paddleocr"):
+        ocr_engine = "easyocr"
 
     tid = uuid.uuid4().hex[:12]
     work = os.path.join(UPLOAD_DIR, tid)
@@ -173,10 +183,13 @@ def api_prepare():
             "narration": [], "clips": 0, "page_count": 0,
             "srt_ready": False, "srt_path": "",
             "llm_cfg": llm_cfg,
+            "ai_ocr_cfg": ai_ocr_cfg,
+            "ocr_engine": ocr_engine,
             "page_range": page_range,
         }
     t = threading.Thread(target=do_prepare,
-                         args=(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang, page_range))
+                         args=(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang,
+                               page_range, ai_ocr_cfg, ocr_engine))
     t.daemon = True
     t.start()
     return jsonify({"task_id": tid})
@@ -294,12 +307,13 @@ def _preflight():
     import shutil
     import importlib.util
     print("=" * 50, flush=True)
-    print("PDF 解说视频生成器 启动自检", flush=True)
+    print("AI PDF解说视频生成器 启动自检", flush=True)
     ff = shutil.which("ffmpeg")
     print(f"  ffmpeg : {'OK ' + ff if ff else '缺失! 请安装 ffmpeg 并加入 PATH'}", flush=True)
     fp = shutil.which("ffprobe")
     print(f"  ffprobe: {'OK ' + fp if fp else '缺失! 请安装 ffmpeg(含 ffprobe)'}", flush=True)
-    for mod in ("flask", "fitz", "PIL", "edge_tts", "easyocr"):
+    for mod in ("flask", "fitz", "PIL", "edge_tts", "easyocr",
+                "rapidocr_onnxruntime", "paddleocr", "paddle"):
         try:
             ok = importlib.util.find_spec(mod) is not None
             print(f"  {mod:8s}: {'OK' if ok else '未安装'}", flush=True)

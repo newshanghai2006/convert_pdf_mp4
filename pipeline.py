@@ -16,6 +16,7 @@ import sys
 import io
 import re
 import json
+import base64
 import time
 import math
 import asyncio
@@ -195,7 +196,8 @@ def make_working_pdf(src_path, out_path, spec):
 # ----------------------------------------------------------------------------
 def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
                        ocr_worker=None, py_exe=None, ocr_lang="ch_sim",
-                       probe_ocr=False):
+                       probe_ocr=False, ai_ocr_cfg=None,
+                       ocr_engine="easyocr"):
     """返回 list[str]，每页一段文字。文字层优先；若全空且 use_ocr，则跑 OCR。
     ocr_lang: 'ch_sim'(简体) 或 'ch_tra'(繁体)，均搭配英文。"""
     doc = fitz.open(pdf_path)
@@ -219,7 +221,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
             out_txt = os.path.join(os.path.dirname(pdf_path), "ocr.txt")
             if os.path.exists(out_txt):
                 os.remove(out_txt)
-            ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe, ocr_lang)
+            ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
+                               ocr_lang, ocr_engine)
             return parse_ocr_txt(out_txt, N)
 
         # 样本里有文字层，再做全量提取
@@ -254,19 +257,25 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
         return pages
 
     if progress_cb:
-        progress_cb("ocr", 0.0, "未检测到文字层，开始 OCR")
+        progress_cb("ai_ocr" if (ai_ocr_cfg or {}).get("enabled") else "ocr",
+                    0.0, "未检测到文字层，开始 AI OCR" if
+                    (ai_ocr_cfg or {}).get("enabled") else "未检测到文字层，开始 OCR")
+
+    if (ai_ocr_cfg or {}).get("enabled"):
+        return generate_ai_ocr(pdf_path, pages, ai_ocr_cfg, progress_cb)
 
     # OCR 结果放在任务自己的目录下（不再用进程 PID 命名的公共临时文件，
     # 否则同一 Flask 进程里并发的两个任务会写到同一个文件、互相污染）。
     out_txt = os.path.join(os.path.dirname(pdf_path), "ocr.txt")
     if os.path.exists(out_txt):
         os.remove(out_txt)
-    ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe, ocr_lang)
+    ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
+                       ocr_lang, ocr_engine)
     return parse_ocr_txt(out_txt, N)
 
 
 def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
-                       ocr_lang="ch_sim"):
+                       ocr_lang="ch_sim", ocr_engine="easyocr"):
     """
     以子进程跑 OCR。一次子进程处理「所有剩余页」，把 torch/easyocr 的加载成本
     只付一次；子进程中途崩溃则重新拉起、从断点续跑。
@@ -280,11 +289,19 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
     避免任务永远卡在“OCR 识别中”。
     """
     py_exe = py_exe or sys.executable
+    if ocr_engine not in ("easyocr", "rapidocr", "paddleocr"):
+        ocr_engine = "easyocr"
     N = fitz.open(pdf_path).page_count
     max_stalls = 3           # 连续无进展的最大次数
     stalls = 0
     last_err = ""
     err_log = out_txt + ".stderr.log"
+    engine_names = {
+        "easyocr": "EasyOCR",
+        "rapidocr": "RapidOCR",
+        "paddleocr": "PaddleOCR",
+    }
+    engine_label = engine_names.get(ocr_engine, "OCR")
     ocr_profiles = [
         {
             "OCR_RENDER_ZOOM": str(150 / 72.0),
@@ -311,7 +328,8 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
         try:
             ef = open(err_log, "w", encoding="utf-8", errors="replace")
             proc = subprocess.Popen(
-                [py_exe, ocr_worker, pdf_path, str(done), str(N), out_txt, ocr_lang],
+                [py_exe, ocr_worker, pdf_path, str(done), str(N), out_txt,
+                 ocr_lang, ocr_engine],
                 stdout=subprocess.DEVNULL, stderr=ef, text=True, env=env)
         except Exception as e:
             last_err = f"无法启动 OCR 子进程: {e}"
@@ -338,7 +356,7 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
             if progress_cb:
                 if cur <= done:
                     el = int(now - t_start)
-                    tip = f"正在加载 OCR 模型并识别首页…（已 {el}s）"
+                    tip = f"正在加载 {engine_label} 模型并识别首页…（已 {el}s）"
                     if stalls > 0:
                         tip = (f"OCR 重试中（第 {stalls+1} 次，已 {el}s）"
                                f"{'；上次: ' + last_err[:80] if last_err else ''}")
@@ -376,8 +394,8 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
         if new_done <= done:                 # 本轮没有识别出任何新页
             stalls += 1
             if stalls >= max_stalls:
-                hint = ("常见原因：① 首次运行无法联网下载 easyocr 模型；"
-                        "② easyocr/torch 未装好。")
+                hint = (f"常见原因：① {engine_label} 首次运行需要准备模型；"
+                        f"② {engine_label} 依赖未安装或版本不兼容。")
                 if "not enough memory" in last_err or "out of memory" in last_err.lower():
                     hint = ("内存不足：easyocr/torch 加载模型或识别大图时内存不够。"
                             "请关闭其它占内存的程序后重试，或调小 _ocr_worker.py 里的 "
@@ -786,6 +804,99 @@ def _call_openai_chat(base_url, api_key, model, messages, temperature=0.4,
                 parts.append(item.get("text", ""))
         content = "\n".join(parts)
     return str(content).strip()
+
+
+def _pdf_page_data_url(page, max_size=1800):
+    """Render one PDF page as a reasonably sized JPEG data URL for vision APIs."""
+    pix = page.get_pixmap(matrix=fitz.Matrix(150 / 72.0, 150 / 72.0),
+                          alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    if max(img.size) > max_size:
+        scale = max_size / float(max(img.size))
+        img = img.resize((max(1, int(img.width * scale)),
+                          max(1, int(img.height * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=86, optimize=True)
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return "data:image/jpeg;base64," + encoded
+
+
+def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None):
+    """Recognize image-only PDF pages through an OpenAI-compatible vision model."""
+    base_url = (llm_cfg or {}).get("base_url", "")
+    api_key = (llm_cfg or {}).get("api_key", "")
+    model = (llm_cfg or {}).get("model", "")
+    provider = (llm_cfg or {}).get("provider", "openai").strip().lower()
+    if not base_url or not model:
+        raise RuntimeError("AI OCR 配置不完整，请填写 base_url 和 model")
+
+    is_nvidia = provider == "nvidia"
+    min_interval = 1.65 if is_nvidia else 0.0
+    next_allowed_at = 0.0
+    prompts = (
+        "请准确识别这张 PDF 页面中的所有可见文字。按正常阅读顺序输出，"
+        "尽量保留标题、段落和换行；不要补写图片中没有的内容，不要解释识别过程。"
+        "如果页面主要是图片且没有文字，只输出空文本。"
+    )
+    doc = fitz.open(pdf_path)
+    out = []
+    failures = 0
+    last_err = ""
+    try:
+        total = doc.page_count
+        for i in range(total):
+            if is_nvidia:
+                wait = max(0.0, next_allowed_at - time.time())
+                if wait > 0:
+                    if progress_cb:
+                        progress_cb("ai_ocr", i / max(1, total),
+                                    f"NVIDIA AI OCR 节流等待 {wait:.1f}s")
+                    time.sleep(wait)
+
+            ok = False
+            for attempt in range(1, 4):
+                if is_nvidia:
+                    next_allowed_at = max(next_allowed_at, time.time()) + min_interval
+                try:
+                    raw = _call_openai_chat(
+                        base_url, api_key, model,
+                        [{"role": "user", "content": [
+                            {"type": "text", "text": prompts},
+                            {"type": "image_url", "image_url": {
+                                "url": _pdf_page_data_url(doc[i])}}
+                        ]}],
+                        temperature=0.0, max_tokens=4096, timeout=180)
+                    text = _clean_ai_text(raw)
+                    out.append(text)
+                    ok = True
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    if is_nvidia and _is_retryable_llm_error(last_err) and attempt < 3:
+                        sleep_s = min(15.0, 1.7 * (2 ** (attempt - 1)))
+                        if progress_cb:
+                            progress_cb("ai_ocr", i / max(1, total),
+                                        f"NVIDIA AI OCR 限流，重试 {attempt + 1}/3")
+                        time.sleep(sleep_s)
+                        continue
+                    print(f"    AI OCR 第 {i + 1}/{total} 页失败，保留原结果: {e}")
+                    break
+            if not ok:
+                failures += 1
+                out.append(fallback_pages[i] if i < len(fallback_pages) else "")
+            if progress_cb:
+                progress_cb("ai_ocr", (i + 1) / max(1, total),
+                            f"AI OCR 识别中 {i + 1}/{total} 页")
+    finally:
+        doc.close()
+
+    if failures:
+        note = f"AI OCR 有 {failures} 页失败，已保留原结果"
+        if failures >= len(out) and last_err:
+            note = "AI OCR 全部失败，已保留原结果"
+        if progress_cb:
+            progress_cb("ai_ocr", 1.0, note)
+    return out
 
 
 def _clean_ai_text(text):

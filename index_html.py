@@ -6,7 +6,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF 解说视频生成器</title>
+<title>AI PDF解说视频生成器</title>
 <style>
   * { box-sizing: border-box; }
   body { margin:0; font-family: -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
@@ -57,8 +57,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <h1>PDF 解说视频生成器</h1>
-  <div class="sub">上传《大众电影》式 PDF → 自动提取文字 → 编辑旁白 → 生成 MP4。封面+标题卡自动生成。</div>
+  <h1>AI PDF解说视频生成器</h1>
+  <div class="sub">上传《大众电影》式 PDF → 自动提取文字 → AI理解/生成旁白 → 生成 MP4。封面+标题卡自动生成。</div>
 
   <!-- 1. 上传 + 参数 -->
   <div class="card">
@@ -101,6 +101,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;margin:0;">
         <input type="checkbox" id="use_ai_narration"> 使用AI自动生成旁白
       </label>
+      <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;margin:8px 0 0;">
+        <input type="checkbox" id="use_ai_ocr"> 使用AI OCR识别纯图片文字
+      </label>
       <div id="ai-config" style="display:none; margin-top:10px;">
         <div style="margin-bottom:8px;">
           <label>LLM 类型</label>
@@ -122,6 +125,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="btn-main" id="btn-prepare">载入并提取文字</button>
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
         <input type="checkbox" id="use_ocr" checked> 纯图片PDF启用OCR(更慢)</label>
+      <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
+        OCR引擎
+        <select id="ocr_engine" style="width:auto;padding:6px 8px;">
+          <option value="easyocr" selected>EasyOCR（当前默认）</option>
+          <option value="rapidocr">RapidOCR（ONNX）</option>
+          <option value="paddleocr">PaddleOCR（中文优化）</option>
+        </select>
+      </label>
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
         识别语言
         <select id="ocr_lang" style="width:auto;padding:6px 8px;">
@@ -213,6 +224,7 @@ let TASK_ID = null;
 
 const $ = id => document.getElementById(id);
 const AI_CFG_KEY = 'mk_dzdy_ai_cfg_v1';
+const OCR_CFG_KEY = 'mk_dzdy_ocr_cfg_v1';
 
 function loadAiCfg(){
   try { return JSON.parse(localStorage.getItem(AI_CFG_KEY) || '{}') || {}; }
@@ -221,6 +233,7 @@ function loadAiCfg(){
 function saveAiCfg(){
   const data = {
     use_ai_narration: $('use_ai_narration').checked,
+    use_ai_ocr: $('use_ai_ocr').checked,
     llm_provider: $('llm_provider').value,
     llm_base_url: $('llm_base_url').value,
     llm_api_key: $('llm_api_key').value,
@@ -228,6 +241,15 @@ function saveAiCfg(){
   };
   try { localStorage.setItem(AI_CFG_KEY, JSON.stringify(data)); }
   catch(e){}
+}
+function saveOcrCfg(){
+  try { localStorage.setItem(OCR_CFG_KEY, JSON.stringify({
+    ocr_engine: $('ocr_engine').value,
+  })); } catch(e){}
+}
+function loadOcrCfg(){
+  try { return JSON.parse(localStorage.getItem(OCR_CFG_KEY) || '{}') || {}; }
+  catch(e){ return {}; }
 }
 const NARR_SAVE_TIMERS = {};
 function saveNarrationSegment(idx, text){
@@ -244,16 +266,23 @@ function debounceSaveNarration(idx, text){
 }
 function syncAiCfgUi(){
   const on = $('use_ai_narration').checked;
+  const aiOcrOn = $('use_ai_ocr').checked;
   const provider = $('llm_provider').value;
-  $('ai-config').style.display = on ? '' : 'none';
-  if (on) $('use_ocr').checked = true;
-  $('use_ocr').disabled = on;
+  const aiOn = on || aiOcrOn;
+  $('ai-config').style.display = aiOn ? '' : 'none';
+  if (aiOn) $('use_ocr').checked = true;
+  $('use_ocr').disabled = aiOn;
+  $('ocr_engine').disabled = aiOcrOn;
   ['llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
     const el=$(id);
-    if(el) el.disabled = !on;
+    if(el) el.disabled = !aiOn;
   });
   if (provider === 'nvidia') {
     $('ai-provider-hint').textContent = 'NVIDIA 模式会自动节流，请把 base_url / API Key / model 填好后再生成。';
+  } else if (aiOcrOn && on) {
+    $('ai-provider-hint').textContent = 'AI OCR 会逐页识别纯图片页面，AI 旁白再根据识别结果生成旁白；模型需要支持图片输入。';
+  } else if (aiOcrOn) {
+    $('ai-provider-hint').textContent = 'AI OCR 会逐页识别纯图片页面；模型需要支持图片输入，识别结果仍可在下一步编辑。';
   } else {
     $('ai-provider-hint').textContent = '开启后，系统会先根据每个片段的 OCR 文本生成旁白，再继续后面的配音流程。';
   }
@@ -262,18 +291,22 @@ function syncAiCfgUi(){
 const savedAiCfg = loadAiCfg();
 if (savedAiCfg) {
   $('use_ai_narration').checked = !!savedAiCfg.use_ai_narration;
+  $('use_ai_ocr').checked = !!savedAiCfg.use_ai_ocr;
   if (savedAiCfg.llm_provider !== undefined) $('llm_provider').value = savedAiCfg.llm_provider;
   if (savedAiCfg.llm_base_url !== undefined) $('llm_base_url').value = savedAiCfg.llm_base_url;
   if (savedAiCfg.llm_api_key !== undefined) $('llm_api_key').value = savedAiCfg.llm_api_key;
   if (savedAiCfg.llm_model !== undefined) $('llm_model').value = savedAiCfg.llm_model;
 }
 syncAiCfgUi();
-['use_ai_narration','llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
+['use_ai_narration','use_ai_ocr','llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
   const el=$(id);
   if(!el) return;
   el.addEventListener('change', ()=>{ syncAiCfgUi(); saveAiCfg(); });
   el.addEventListener('input', saveAiCfg);
 });
+const savedOcrCfg = loadOcrCfg();
+if (savedOcrCfg.ocr_engine) $('ocr_engine').value = savedOcrCfg.ocr_engine;
+$('ocr_engine').addEventListener('change', saveOcrCfg);
 
 // 填充声音/语速
 fetch('/api/voices').then(r=>r.json()).then(d=>{
@@ -327,7 +360,9 @@ $('btn-prepare').onclick=()=>{
   fd.append('pdf', window._file);
   fd.append('pages_per_clip', $('pages_per_clip').value);
   fd.append('use_ocr', $('use_ocr').checked ? 'true':'false');
+  fd.append('ocr_engine', $('ocr_engine').value);
   fd.append('use_ai_narration', $('use_ai_narration').checked ? 'true':'false');
+  fd.append('use_ai_ocr', $('use_ai_ocr').checked ? 'true':'false');
   fd.append('llm_provider', $('llm_provider').value);
   fd.append('llm_base_url', $('llm_base_url').value);
   fd.append('llm_api_key', $('llm_api_key').value);
