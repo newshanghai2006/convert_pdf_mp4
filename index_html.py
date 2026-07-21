@@ -157,7 +157,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="card" id="card-opt" style="display:none;">
     <h2>③ 标题卡与配音设置</h2>
     <div class="grid2">
-      <div><label>主标题</label><input type="text" id="title" value="大众电影"></div>
+      <div><label>主标题</label><input type="text" id="title" value="人民画报"></div>
       <div><label>副标题(期号)</label><input type="text" id="subtitle" placeholder="如 1989年第11期 · 总第437期"></div>
       <div><label>徽标文字</label><input type="text" id="feature" placeholder="如 封面 青年演员 何晴"></div>
       <div><label>副信息1</label><input type="text" id="feature2" placeholder="如 首届中国电影节"></div>
