@@ -113,7 +113,8 @@ def do_generate(tid, pdf_path, params, narration):
         res = _pipeline().build_video(pdf_path, out_path, params, narration, cb)
         if res:
             srt_path = os.path.splitext(out_path)[0] + ".srt"
-            srt_ready = (params.get("subtitle_mode") in ("srt", "burn")
+            srt_ready = (params.get("subtitle_mode") in
+                         ("srt", "burn", "burn_bilingual")
                          and os.path.exists(srt_path))
             update_task(tid, stage="done", progress=1.0,
                         message="视频生成完成", output_ready=True,
@@ -244,11 +245,27 @@ def api_generate():
         pdf_path = st["pdf_path"]
         out_path = st["output_path"]
         narration = list(st.get("narration", []))
+        stored_llm_cfg = dict(st.get("llm_cfg") or {})
 
     try:
         clip_durs = [float(x) for x in (data.get("clip_durations") or [])]
     except Exception:
         clip_durs = []
+    subtitle_mode = data.get("subtitle_mode", "none")
+    if subtitle_mode not in ("none", "srt", "burn", "burn_bilingual"):
+        subtitle_mode = "none"
+    llm_cfg = {
+        "provider": str(data.get("llm_provider") or
+                        stored_llm_cfg.get("provider") or "openai").strip().lower(),
+        "base_url": str(data.get("llm_base_url") or
+                        stored_llm_cfg.get("base_url") or "").strip(),
+        "api_key": str(data.get("llm_api_key") or
+                       stored_llm_cfg.get("api_key") or "").strip(),
+        "model": str(data.get("llm_model") or
+                     stored_llm_cfg.get("model") or "").strip(),
+    }
+    if llm_cfg["provider"] not in ("openai", "nvidia"):
+        llm_cfg["provider"] = "openai"
     params = {
         "pages_per_clip": int(data.get("pages_per_clip", 2)),
         "clip_duration": float(data.get("clip_duration", 12.0)),
@@ -261,7 +278,11 @@ def api_generate():
         "custom_w": float(data.get("custom_w", 16) or 16),
         "custom_h": float(data.get("custom_h", 9) or 9),
         "quality": int(data.get("quality", 1080) or 1080),
-        "subtitle_mode": data.get("subtitle_mode", "none"),
+        "subtitle_mode": subtitle_mode,
+        "subtitle_zh_color": data.get("subtitle_zh_color", "#66FF7A"),
+        "subtitle_en_color": data.get("subtitle_en_color", "#FFFFFF"),
+        "subtitle_outline_color": data.get("subtitle_outline_color", "#101010"),
+        "llm_cfg": llm_cfg,
         "title": data.get("title", "大众电影"),
         "subtitle": data.get("subtitle", ""),
         "feature": data.get("feature", ""),

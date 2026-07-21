@@ -22,6 +22,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     width:100%; background:#1c150f; border:1px solid #4a3a2a; color:#eee;
     border-radius:8px; padding:9px 10px; font-size:14px; font-family:inherit; }
   textarea { resize:vertical; line-height:1.7; }
+  input[type=color] { width:46px; height:34px; padding:2px; border:1px solid #4a3a2a;
+                      border-radius:6px; background:#1c150f; cursor:pointer; }
   .seg-nar textarea { min-height:110px; font-size:15px; padding:10px 12px; }
   .row { display:flex; gap:12px; flex-wrap:wrap; }
   .row > div { flex:1; min-width:140px; }
@@ -199,10 +201,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <option value="none" selected>不生成字幕</option>
           <option value="srt">生成 SRT 字幕文件（随视频单独下载）</option>
           <option value="burn">把字幕烧进画面（硬字幕，始终显示）</option>
+          <option value="burn_bilingual">中英双语硬字幕（英文由AI翻译）</option>
         </select>
         <div class="hint">字幕内容取自「编辑旁白」；烧录为硬字幕需重新编码，稍慢。</div>
       </div>
     </div>
+    <div id="subtitle-style" class="grid3" style="display:none;margin-top:8px;">
+      <div><label>中文颜色</label><input type="color" id="subtitle_zh_color" value="#66ff7a"></div>
+      <div id="subtitle-en-color-wrap"><label>英文颜色</label><input type="color" id="subtitle_en_color" value="#ffffff"></div>
+      <div><label>描边颜色</label><input type="color" id="subtitle_outline_color" value="#101010"></div>
+    </div>
+    <div class="hint" id="subtitle-style-hint" style="display:none;">粗体无衬线字幕：中文使用微软雅黑，英文使用 Arial。</div>
 
     <div class="btn-row">
       <button class="btn-main" id="btn-generate">生成视频</button>
@@ -225,6 +234,7 @@ let TASK_ID = null;
 const $ = id => document.getElementById(id);
 const AI_CFG_KEY = 'mk_dzdy_ai_cfg_v1';
 const OCR_CFG_KEY = 'mk_dzdy_ocr_cfg_v1';
+const SUBTITLE_CFG_KEY = 'mk_dzdy_subtitle_cfg_v1';
 
 function loadAiCfg(){
   try { return JSON.parse(localStorage.getItem(AI_CFG_KEY) || '{}') || {}; }
@@ -251,6 +261,27 @@ function loadOcrCfg(){
   try { return JSON.parse(localStorage.getItem(OCR_CFG_KEY) || '{}') || {}; }
   catch(e){ return {}; }
 }
+function saveSubtitleCfg(){
+  const data = {
+    subtitle_mode: $('subtitle_mode').value,
+    subtitle_zh_color: $('subtitle_zh_color').value,
+    subtitle_en_color: $('subtitle_en_color').value,
+    subtitle_outline_color: $('subtitle_outline_color').value,
+  };
+  try { localStorage.setItem(SUBTITLE_CFG_KEY, JSON.stringify(data)); }
+  catch(e){}
+}
+function loadSubtitleCfg(){
+  try { return JSON.parse(localStorage.getItem(SUBTITLE_CFG_KEY) || '{}') || {}; }
+  catch(e){ return {}; }
+}
+function updateSubtitleUi(){
+  const mode = $('subtitle_mode').value;
+  const burn = mode === 'burn' || mode === 'burn_bilingual';
+  $('subtitle-style').style.display = burn ? '' : 'none';
+  $('subtitle-style-hint').style.display = burn ? '' : 'none';
+  $('subtitle-en-color-wrap').style.display = mode === 'burn_bilingual' ? '' : 'none';
+}
 const NARR_SAVE_TIMERS = {};
 function saveNarrationSegment(idx, text){
   if(!TASK_ID) return;
@@ -267,18 +298,22 @@ function debounceSaveNarration(idx, text){
 function syncAiCfgUi(){
   const on = $('use_ai_narration').checked;
   const aiOcrOn = $('use_ai_ocr').checked;
+  const translateOn = $('subtitle_mode').value === 'burn_bilingual';
   const provider = $('llm_provider').value;
-  const aiOn = on || aiOcrOn;
-  $('ai-config').style.display = aiOn ? '' : 'none';
-  if (aiOn) $('use_ocr').checked = true;
-  $('use_ocr').disabled = aiOn;
+  const aiPipelineOn = on || aiOcrOn;
+  const configOn = aiPipelineOn || translateOn;
+  $('ai-config').style.display = configOn ? '' : 'none';
+  if (aiPipelineOn) $('use_ocr').checked = true;
+  $('use_ocr').disabled = aiPipelineOn;
   $('ocr_engine').disabled = aiOcrOn;
   ['llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
     const el=$(id);
-    if(el) el.disabled = !aiOn;
+    if(el) el.disabled = !configOn;
   });
   if (provider === 'nvidia') {
     $('ai-provider-hint').textContent = 'NVIDIA 模式会自动节流，请把 base_url / API Key / model 填好后再生成。';
+  } else if (translateOn && !aiPipelineOn) {
+    $('ai-provider-hint').textContent = '双语字幕会使用这里的 LLM 配置批量翻译英文，不会改变旁白内容。';
   } else if (aiOcrOn && on) {
     $('ai-provider-hint').textContent = 'AI OCR 会逐页识别纯图片页面，AI 旁白再根据识别结果生成旁白；模型需要支持图片输入。';
   } else if (aiOcrOn) {
@@ -307,6 +342,15 @@ syncAiCfgUi();
 const savedOcrCfg = loadOcrCfg();
 if (savedOcrCfg.ocr_engine) $('ocr_engine').value = savedOcrCfg.ocr_engine;
 $('ocr_engine').addEventListener('change', saveOcrCfg);
+const savedSubtitleCfg = loadSubtitleCfg();
+['subtitle_mode','subtitle_zh_color','subtitle_en_color','subtitle_outline_color'].forEach(id=>{
+  if(savedSubtitleCfg[id] !== undefined) $(id).value = savedSubtitleCfg[id];
+  $(id).addEventListener('change', ()=>{
+    updateSubtitleUi(); syncAiCfgUi(); saveSubtitleCfg(); saveAiCfg();
+  });
+});
+updateSubtitleUi();
+syncAiCfgUi();
 
 // 填充声音/语速
 fetch('/api/voices').then(r=>r.json()).then(d=>{
@@ -430,6 +474,10 @@ $('clip_duration').addEventListener('input',()=>{
 
 // 生成视频
 $('btn-generate').onclick=()=>{
+  if($('subtitle_mode').value==='burn_bilingual' &&
+     (!$('llm_base_url').value.trim() || !$('llm_model').value.trim())){
+    alert('中英双语字幕需要填写 LLM base_url 和 Model'); return;
+  }
   const clip_durations=[...document.querySelectorAll('#nar-list .seg-dur')].map(t=>+t.value||+$('clip_duration').value);
   const payload={
     task_id:TASK_ID, clip_durations,
@@ -443,6 +491,13 @@ $('btn-generate').onclick=()=>{
     custom_w:$('custom_w').value, custom_h:$('custom_h').value,
     quality:$('quality').value,
     subtitle_mode:$('subtitle_mode').value,
+    subtitle_zh_color:$('subtitle_zh_color').value,
+    subtitle_en_color:$('subtitle_en_color').value,
+    subtitle_outline_color:$('subtitle_outline_color').value,
+    llm_provider:$('llm_provider').value,
+    llm_base_url:$('llm_base_url').value,
+    llm_api_key:$('llm_api_key').value,
+    llm_model:$('llm_model').value,
     title:$('title').value, subtitle:$('subtitle').value,
     feature:$('feature').value, feature2:$('feature2').value,
     feature3:$('feature3').value, tagline:$('tagline').value,

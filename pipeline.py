@@ -1164,14 +1164,9 @@ def split_caption(text, max_len=20):
     return [c for c in chunks if c]
 
 
-def build_srt(narration, clip_durations, raw_durs, title_duration):
-    """
-    生成 SRT 字幕字符串。
-    时间轴：封面(title_duration)无字幕；随后第 i 段从 start_i 起，
-    其“说话时长”= min(该段原始配音时长, 该段片段时长)，把切好的小段按字数比例铺在这段时间里。
-    """
-    lines = []
-    idx = 1
+def build_caption_cues(narration, clip_durations, raw_durs, title_duration):
+    """Build the shared timing cues used by SRT and bilingual ASS output."""
+    cues = []
     t = float(title_duration)
     for i, text in enumerate(narration):
         dur = float(clip_durations[i])
@@ -1187,33 +1182,225 @@ def build_srt(narration, clip_durations, raw_durs, title_duration):
                 e = t + speak if j == len(caps) - 1 else cur + seg
                 if e - s < 0.3:            # 太短的给个下限
                     e = min(t + speak, s + 0.3)
-                lines.append(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{c}\n")
-                idx += 1
+                cues.append({"start": s, "end": e, "text": c})
                 cur += seg
         t += dur
+    return cues
+
+
+def build_srt_from_cues(cues, translations=None):
+    lines = []
+    translations = translations or []
+    for idx, cue in enumerate(cues, start=1):
+        text = cue["text"]
+        if idx - 1 < len(translations) and translations[idx - 1].strip():
+            text += "\n" + translations[idx - 1].strip()
+        lines.append(
+            f"{idx}\n{_srt_ts(cue['start'])} --> {_srt_ts(cue['end'])}\n{text}\n")
     return "\n".join(lines)
 
 
-def burn_subtitles(video_in, srt_path, video_out, font_dir, font_name, height):
+def build_srt(narration, clip_durations, raw_durs, title_duration):
+    """Generate the original Chinese-only SRT output."""
+    cues = build_caption_cues(
+        narration, clip_durations, raw_durs, title_duration)
+    return build_srt_from_cues(cues)
+
+
+def _parse_translation_json(raw, expected):
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    start = text.find("[")
+    end = text.rfind("]")
+    if start < 0 or end < start:
+        raise RuntimeError("AI 翻译返回内容不是 JSON 数组")
+    try:
+        values = json.loads(text[start:end + 1])
+    except Exception as e:
+        raise RuntimeError(f"AI 翻译返回 JSON 解析失败: {e}") from e
+    if not isinstance(values, list) or len(values) != expected:
+        raise RuntimeError(
+            f"AI 翻译返回数量不匹配：需要 {expected} 条，实际 {len(values) if isinstance(values, list) else 0} 条")
+    return [re.sub(r"\s+", " ", str(x or "")).strip() for x in values]
+
+
+def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
+    """Translate Chinese subtitle cues in batches through the configured LLM."""
+    if not cues:
+        return []
+    provider = (llm_cfg or {}).get("provider", "openai").strip().lower()
+    base_url = (llm_cfg or {}).get("base_url", "").strip()
+    api_key = (llm_cfg or {}).get("api_key", "").strip()
+    model = (llm_cfg or {}).get("model", "").strip()
+    if not base_url or not model:
+        raise RuntimeError("双语字幕需要填写 LLM base_url 和 model")
+
+    is_nvidia = provider == "nvidia"
+    min_interval = 1.65 if is_nvidia else 0.0
+    next_allowed_at = 0.0
+    batch_size = 16
+    translated = []
+    total_batches = (len(cues) + batch_size - 1) // batch_size
+    system_msg = (
+        "You translate Chinese video subtitles into concise, natural English. "
+        "Keep names and facts accurate. Return only a JSON array of strings, "
+        "with exactly one English translation for each input item, preserving order."
+    )
+    for batch_index, start in enumerate(range(0, len(cues), batch_size)):
+        batch = [c["text"] for c in cues[start:start + batch_size]]
+        if is_nvidia:
+            wait = max(0.0, next_allowed_at - time.time())
+            if wait > 0:
+                if progress_cb:
+                    progress_cb("translate", batch_index / max(1, total_batches),
+                                f"NVIDIA 翻译节流等待 {wait:.1f}s")
+                time.sleep(wait)
+
+        last_err = ""
+        attempts = 3 if is_nvidia else 1
+        for attempt in range(1, attempts + 1):
+            if is_nvidia:
+                next_allowed_at = max(next_allowed_at, time.time()) + min_interval
+            try:
+                raw = _call_openai_chat(
+                    base_url, api_key, model,
+                    [{"role": "system", "content": system_msg},
+                     {"role": "user", "content": json.dumps(batch, ensure_ascii=False)}],
+                    temperature=0.1,
+                    max_tokens=min(4096, max(1024, len(batch) * 160)),
+                    timeout=180,
+                )
+                translated.extend(_parse_translation_json(raw, len(batch)))
+                break
+            except Exception as e:
+                last_err = str(e)
+                if (is_nvidia and _is_retryable_llm_error(last_err)
+                        and attempt < attempts):
+                    sleep_s = min(15.0, 1.7 * (2 ** (attempt - 1)))
+                    time.sleep(sleep_s)
+                    continue
+                raise RuntimeError(
+                    f"AI 英文字幕翻译失败（第 {batch_index + 1}/{total_batches} 批）: {last_err}") from e
+        if progress_cb:
+            progress_cb("translate", (batch_index + 1) / max(1, total_batches),
+                        f"AI 翻译英文字幕 {min(start + len(batch), len(cues))}/{len(cues)} 条")
+    return translated
+
+
+def _ass_ts(sec):
+    sec = max(0.0, float(sec))
+    total_cs = int(round(sec * 100))
+    h, total_cs = divmod(total_cs, 360000)
+    m, total_cs = divmod(total_cs, 6000)
+    s, cs = divmod(total_cs, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _ass_color(value, default):
+    value = (value or "").strip()
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", value):
+        value = default
+    r, g, b = value[1:3], value[3:5], value[5:7]
+    return f"&H00{b}{g}{r}".upper()
+
+
+def _ass_escape(text):
+    return (text or "").replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+
+
+def _wrap_english(text, max_len=52):
+    words = (text or "").split()
+    if not words:
+        return ""
+    lines = []
+    current = []
+    for word in words:
+        candidate = " ".join(current + [word])
+        if current and len(candidate) > max_len:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    if len(lines) > 2:
+        lines = [lines[0], " ".join(lines[1:])]
+    return r"\N".join(lines)
+
+
+def build_bilingual_ass(cues, translations, width, height,
+                        zh_color="#66FF7A", en_color="#FFFFFF",
+                        outline_color="#101010"):
+    """Create two independently styled subtitle rows: Chinese above English."""
+    zh_size = max(24, int(height * 0.046))
+    en_size = max(18, int(height * 0.032))
+    outline = max(2, int(height * 0.0028))
+    en_margin = max(24, int(height * 0.038))
+    zh_margin = en_margin + en_size * 2 + max(10, int(height * 0.012))
+    zh_ass = _ass_color(zh_color, "#66FF7A")
+    en_ass = _ass_color(en_color, "#FFFFFF")
+    outline_ass = _ass_color(outline_color, "#101010")
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {int(width)}
+PlayResY: {int(height)}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Chinese,Microsoft YaHei,{zh_size},{zh_ass},{zh_ass},{outline_ass},&H70000000,-1,0,0,0,100,100,0,0,1,{outline},1,2,35,35,{zh_margin},1
+Style: English,Arial,{en_size},{en_ass},{en_ass},{outline_ass},&H70000000,-1,0,0,0,100,100,0,0,1,{outline},1,2,35,35,{en_margin},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events = []
+    for cue, english in zip(cues, translations):
+        start = _ass_ts(cue["start"])
+        end = _ass_ts(cue["end"])
+        zh = _ass_escape(cue["text"])
+        en = _wrap_english(_ass_escape(english))
+        events.append(f"Dialogue: 0,{start},{end},Chinese,,0,0,0,,{zh}")
+        if en:
+            events.append(f"Dialogue: 0,{start},{end},English,,0,0,0,,{en}")
+    return header + "\n".join(events) + "\n"
+
+
+def _copy_subtitle_fonts(target_dir, font_dir):
+    import shutil
+    candidates = [
+        (os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "msyhbd.ttc"),
+         "msyhbd.ttc"),
+        (os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arialbd.ttf"),
+         "arialbd.ttf"),
+        (os.path.join(font_dir, "font.ttf"), "subfont.ttf"),
+    ]
+    for src, name in candidates:
+        try:
+            if os.path.exists(src):
+                shutil.copy(src, os.path.join(target_dir, name))
+        except Exception:
+            pass
+
+
+def burn_subtitles(video_in, srt_path, video_out, font_dir, font_name, height,
+                   primary_color="#FFFFFF", outline_color="#202020"):
     """
     把 SRT 硬烧进画面并重编码。
     关键：Windows 绝对路径里的 ':' '\\' 会破坏 ffmpeg 滤镜串解析，
     所以把字体拷到字幕同目录、cwd 设到该目录，滤镜里只用相对文件名和 fontsdir=. 。
     """
-    import shutil
     srt_dir = os.path.dirname(os.path.abspath(srt_path))
     srt_name = os.path.basename(srt_path)
-    # 把中文字体拷到字幕目录，供 libass 用 fontsdir=. 找到（STKaiti 非系统字体）
-    try:
-        src_font = os.path.join(font_dir, "font.ttf")
-        if os.path.exists(src_font):
-            shutil.copy(src_font, os.path.join(srt_dir, "subfont.ttf"))
-    except Exception:
-        pass
+    _copy_subtitle_fonts(srt_dir, font_dir)
     font_size = max(14, int(height * 0.045))
     style = (f"FontName={font_name},FontSize={font_size},"
-             "PrimaryColour=&H00FFFFFF,OutlineColour=&H00202020,"
-             "BorderStyle=1,Outline=2,Shadow=1,MarginV=40")
+             f"PrimaryColour={_ass_color(primary_color, '#FFFFFF')},"
+             f"OutlineColour={_ass_color(outline_color, '#202020')},"
+             "Bold=1,BorderStyle=1,Outline=2,Shadow=1,MarginV=40")
     vf = f"subtitles={srt_name}:fontsdir=.:force_style='{style}'"
     cmd = ["ffmpeg", "-y", "-i", os.path.abspath(video_in), "-vf", vf,
            "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
@@ -1221,6 +1408,24 @@ def burn_subtitles(video_in, srt_path, video_out, font_dir, font_name, height):
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=srt_dir)
     if result.returncode != 0:
         print("  ERROR in burn subtitles:")
+        print("  " + (result.stderr or "")[-800:])
+        return False
+    return True
+
+
+def burn_ass_subtitles(video_in, ass_path, video_out, font_dir):
+    """Burn a pre-styled ASS subtitle file into the video."""
+    ass_dir = os.path.dirname(os.path.abspath(ass_path))
+    ass_name = os.path.basename(ass_path)
+    _copy_subtitle_fonts(ass_dir, font_dir)
+    vf = f"subtitles={ass_name}:fontsdir=."
+    cmd = ["ffmpeg", "-y", "-i", os.path.abspath(video_in), "-vf", vf,
+           "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+           "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
+           os.path.abspath(video_out)]
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=ass_dir)
+    if result.returncode != 0:
+        print("  ERROR in burn bilingual subtitles:")
         print("  " + (result.stderr or "")[-800:])
         return False
     return True
@@ -1346,13 +1551,33 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
     if not final_audio:
         return None
 
-    # 字幕：由旁白 + 每片段时长生成 SRT（可选）
-    subtitle_mode = params.get("subtitle_mode", "none")   # none | srt | burn
+    # 字幕：由旁白 + 每片段时长生成 SRT/ASS（可选）
+    subtitle_mode = params.get("subtitle_mode", "none")
+    burn_mode = subtitle_mode in ("burn", "burn_bilingual")
     srt_path = os.path.splitext(out_path)[0] + ".srt"
-    if subtitle_mode in ("srt", "burn"):
+    ass_path = os.path.splitext(out_path)[0] + ".ass"
+    cues = []
+    translations = []
+    if subtitle_mode in ("srt", "burn", "burn_bilingual"):
         if progress_cb:
             progress_cb("merge", 0.93, "生成字幕(SRT)")
-        srt_text = build_srt(narration, clip_durations, raw_durs, title_duration)
+        cues = build_caption_cues(
+            narration, clip_durations, raw_durs, title_duration)
+        if subtitle_mode == "burn_bilingual":
+            if progress_cb:
+                progress_cb("translate", 0.0, "AI 翻译英文字幕")
+            translations = generate_ai_subtitle_translations(
+                cues, params.get("llm_cfg") or {}, progress_cb)
+            srt_text = build_srt_from_cues(cues, translations)
+            ass_text = build_bilingual_ass(
+                cues, translations, Wd, Ht,
+                params.get("subtitle_zh_color", "#66FF7A"),
+                params.get("subtitle_en_color", "#FFFFFF"),
+                params.get("subtitle_outline_color", "#101010"))
+            with open(ass_path, "w", encoding="utf-8-sig") as f:
+                f.write(ass_text)
+        else:
+            srt_text = build_srt_from_cues(cues)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_text)
 
@@ -1360,7 +1585,7 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
     if progress_cb:
         progress_cb("merge", 0.95, "合成最终视频")
     # 若要烧录字幕，先合成到临时文件，再重编码烧字幕到 out_path
-    mux_out = out_path if subtitle_mode != "burn" else os.path.join(workdir, "muxed.mp4")
+    mux_out = out_path if not burn_mode else os.path.join(workdir, "muxed.mp4")
     cmd = ["ffmpeg", "-y", "-i", video_path, "-i", final_audio,
            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
            "-map", "0:v", "-map", "1:a",
@@ -1370,11 +1595,17 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
     if not run_ffmpeg(cmd, "merge"):
         return None
 
-    if subtitle_mode == "burn":
+    if burn_mode:
         if progress_cb:
             progress_cb("merge", 0.97, "烧录字幕进画面")
         font_dir = os.path.dirname(font_path) if font_path else os.path.dirname(os.path.abspath(__file__))
-        ok = burn_subtitles(mux_out, srt_path, out_path, font_dir, "STKaiti", Ht)
+        if subtitle_mode == "burn_bilingual":
+            ok = burn_ass_subtitles(mux_out, ass_path, out_path, font_dir)
+        else:
+            ok = burn_subtitles(
+                mux_out, srt_path, out_path, font_dir, "Microsoft YaHei", Ht,
+                params.get("subtitle_zh_color", "#FFFFFF"),
+                params.get("subtitle_outline_color", "#202020"))
         if not ok:
             # 烧录失败（如字体/滤镜问题）不整体失败：退回未烧录版本 + 保留 SRT
             import shutil
