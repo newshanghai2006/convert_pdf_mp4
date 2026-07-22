@@ -613,7 +613,12 @@ $('btn-generate').onclick=()=>{
   };
   $('status2').textContent='提交中…';
   fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-    .then(r=>r.json()).then(()=>pollGen());
+    .then(async r=>{
+      const result=await r.json();
+      if(!r.ok) throw new Error(result.error||'生成请求提交失败');
+      pollGen();
+    })
+    .catch(err=>{ $('status2').textContent=err.message; });
 };
 
 function pollGen(){
@@ -630,7 +635,15 @@ function pollGen(){
       $('status2').innerHTML='<span class="ok">完成！可预览/下载。</span>';
       return;
     }
-    if(st.stage==='error'){ $('status2').innerHTML='<span class="err">'+st.message+'</span>'; return; }
+    if(st.stage==='error'){
+      $('status2').textContent='';
+      const error=document.createElement('span');
+      error.className='err'; error.textContent=st.message||'生成失败';
+      const hint=document.createElement('div');
+      hint.className='hint'; hint.textContent='可直接再次点击“生成视频”，将复用已提取文字，不会重新执行 OCR。';
+      $('status2').append(error,hint);
+      return;
+    }
     setTimeout(pollGen, 1000);
   });
 }

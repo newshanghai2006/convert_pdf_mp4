@@ -300,7 +300,11 @@ def api_generate():
         st = TASKS.get(tid)
         if not st:
             return jsonify({"error": "not found"}), 404
-        if st["stage"] != "ready":
+        can_retry_generation = (
+            st["stage"] == "ready"
+            or (st["stage"] == "error" and st.get("generation_params"))
+        )
+        if not can_retry_generation:
             return jsonify({"error": "not ready"}), 400
         pdf_path = st["pdf_path"]
         out_path = st["output_path"]
@@ -356,7 +360,15 @@ def api_generate():
         "voice": data.get("voice", "zh-CN-YunxiNeural"),
         "rate": data.get("rate", "+6%"),
     }
-    update_task(tid, stage="generating", progress=0.0, message="开始生成视频")
+    update_task(
+        tid,
+        stage="generating",
+        progress=0.0,
+        message="开始生成视频（复用已提取文字，不会重新执行 OCR）",
+        output_ready=False,
+        srt_ready=False,
+        generation_params=params,
+    )
     t = threading.Thread(target=do_generate, args=(tid, pdf_path, params, narration))
     t.daemon = True
     t.start()

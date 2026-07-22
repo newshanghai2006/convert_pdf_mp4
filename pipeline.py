@@ -1266,6 +1266,10 @@ class _TranslationCountError(RuntimeError):
     pass
 
 
+class _TranslationFormatError(RuntimeError):
+    pass
+
+
 def _parse_translation_json(raw, expected):
     text = (raw or "").strip()
     if text.startswith("```"):
@@ -1274,11 +1278,11 @@ def _parse_translation_json(raw, expected):
     start = text.find("[")
     end = text.rfind("]")
     if start < 0 or end < start:
-        raise RuntimeError("AI 翻译返回内容不是 JSON 数组")
+        raise _TranslationFormatError("AI 翻译返回内容不是 JSON 数组")
     try:
         values = json.loads(text[start:end + 1])
     except Exception as e:
-        raise RuntimeError(f"AI 翻译返回 JSON 解析失败: {e}") from e
+        raise _TranslationFormatError(f"AI 翻译返回 JSON 解析失败: {e}") from e
     if not isinstance(values, list) or len(values) != expected:
         raise _TranslationCountError(
             f"AI 翻译返回数量不匹配：需要 {expected} 条，实际 {len(values) if isinstance(values, list) else 0} 条")
@@ -1301,13 +1305,14 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
     next_allowed_at = 0.0
     batch_size = 8
     completed = 0
+    failed = 0
     system_msg = (
         "You translate Chinese video subtitles into concise, natural English. "
         "Keep names and facts accurate. Return only a JSON array of strings, "
         "with exactly one English translation for each input item, preserving order."
     )
     def translate_batch(batch, label):
-        nonlocal next_allowed_at, completed
+        nonlocal next_allowed_at, completed, failed
         attempts = 3
         last_err = ""
         for attempt in range(1, attempts + 1):
@@ -1334,28 +1339,39 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
                     progress_cb("translate", completed / max(1, len(cues)),
                                 f"AI 翻译英文字幕 {completed}/{len(cues)} 条")
                 return result
-            except _TranslationCountError as e:
+            except (_TranslationCountError, _TranslationFormatError) as e:
                 last_err = str(e)
                 if len(batch) > 1:
                     mid = len(batch) // 2
-                    print(f"    AI 字幕翻译 {label} 返回数量不完整，拆分为 {mid}+{len(batch)-mid} 条重试")
+                    print(f"    AI 字幕翻译 {label} 返回不完整，拆分为 {mid}+{len(batch)-mid} 条重试")
                     return (translate_batch(batch[:mid], label + "A") +
                             translate_batch(batch[mid:], label + "B"))
             except Exception as e:
                 last_err = str(e)
+                # 认证、模型不存在等不可重试错误不再浪费整批时间。
+                if not _is_retryable_llm_error(last_err):
+                    failed += len(batch)
+                    completed += len(batch)
+                    print(f"    AI 字幕翻译 {label} 失败，保留中文并继续生成: {last_err}")
+                    return [""] * len(batch)
 
             if attempt < attempts:
                 retryable = _is_retryable_llm_error(last_err)
                 sleep_s = min(12.0, (1.7 if retryable else 0.8) * (2 ** (attempt - 1)))
                 time.sleep(sleep_s)
                 continue
-            raise RuntimeError(f"AI 英文字幕翻译失败（{label}）: {last_err}")
-        raise RuntimeError(f"AI 英文字幕翻译失败（{label}）: {last_err}")
+            failed += len(batch)
+            completed += len(batch)
+            print(f"    AI 字幕翻译 {label} 重试后仍失败，保留中文并继续生成: {last_err}")
+            return [""] * len(batch)
 
     translated = []
     for batch_index, start in enumerate(range(0, len(cues), batch_size), start=1):
         batch = [c["text"] for c in cues[start:start + batch_size]]
         translated.extend(translate_batch(batch, f"第 {batch_index} 批"))
+    if failed and progress_cb:
+        progress_cb("translate", 1.0,
+                    f"{failed} 条英文字幕翻译失败，已保留中文并继续生成")
     return translated
 
 
