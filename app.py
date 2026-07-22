@@ -49,6 +49,25 @@ RATES = ["+12%", "+6%", "+0%", "-10%", "-20%"]
 # 任务状态  task_id -> dict
 TASKS = {}
 TASKS_LOCK = threading.Lock()
+TITLE_PREVIEW_LOCK = threading.Lock()
+
+
+def _bounded_float(data, key, default, low, high):
+    try:
+        value = float(data.get(key, default))
+    except Exception:
+        value = default
+    return max(low, min(high, value))
+
+
+def _title_font_sizes(data):
+    return {
+        "title": _bounded_float(data, "title_font_title", 100, 40, 180),
+        "subtitle": _bounded_float(data, "title_font_subtitle", 52, 20, 100),
+        "badge": _bounded_float(data, "title_font_badge", 32, 16, 72),
+        "info": _bounded_float(data, "title_font_info", 34, 16, 72),
+        "tagline": _bounded_float(data, "title_font_tagline", 28, 14, 64),
+    }
 
 
 def update_task(tid, **kw):
@@ -136,6 +155,47 @@ def index():
 @app.route("/api/voices")
 def api_voices():
     return jsonify({"voices": VOICES, "rates": RATES})
+
+
+@app.route("/api/title_preview", methods=["POST"])
+def api_title_preview():
+    data = request.get_json(force=True)
+    tid = data.get("task_id")
+    with TASKS_LOCK:
+        st = TASKS.get(tid)
+        if not st:
+            return jsonify({"error": "task not found"}), 404
+        pdf_path = st.get("pdf_path")
+    if not pdf_path or not os.path.exists(pdf_path):
+        return jsonify({"error": "pdf not found"}), 404
+
+    style = data.get("title_card_style", "classic")
+    if style not in ("classic", "custom"):
+        style = "classic"
+    p = _pipeline()
+    full_w, full_h = p.compute_dimensions(
+        data.get("aspect", "16:9"),
+        float(data.get("custom_w", 16) or 16),
+        float(data.get("custom_h", 9) or 9),
+        int(data.get("quality", 1080) or 1080))
+    scale = min(1.0, 720.0 / max(full_w, full_h))
+    width = max(160, int(full_w * scale))
+    height = max(160, int(full_h * scale))
+    preview_dir = os.path.join(os.path.dirname(pdf_path), "title_preview")
+    with TITLE_PREVIEW_LOCK:
+        cover_path = os.path.join(preview_dir, "page_01.png")
+        if not os.path.exists(cover_path):
+            p.extract_cover_page(pdf_path, preview_dir)
+        title_path = p.create_title_card(
+            preview_dir, FONT_PATH,
+            data.get("title", "大众电影"), data.get("subtitle", ""),
+            data.get("feature", ""), data.get("feature2", ""),
+            data.get("feature3", ""), data.get("tagline", ""),
+            width, height, style, _title_font_sizes(data))
+        with open(title_path, "rb") as f:
+            image_data = f.read()
+    return Response(image_data, mimetype="image/png",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.route("/api/prepare", methods=["POST"])
@@ -283,6 +343,10 @@ def api_generate():
         "subtitle_en_color": data.get("subtitle_en_color", "#FFFFFF"),
         "subtitle_outline_color": data.get("subtitle_outline_color", "#101010"),
         "llm_cfg": llm_cfg,
+        "title_card_style": (data.get("title_card_style", "classic")
+                             if data.get("title_card_style", "classic") in
+                             ("classic", "custom") else "classic"),
+        "title_font_sizes": _title_font_sizes(data),
         "title": data.get("title", "大众电影"),
         "subtitle": data.get("subtitle", ""),
         "feature": data.get("feature", ""),

@@ -530,8 +530,25 @@ def trim_white_border(img, pad=6):
     return img
 
 
+def extract_cover_page(pdf_path, video_dir):
+    """Render only the first PDF page for the title-card preview."""
+    os.makedirs(video_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    try:
+        if doc.page_count < 1:
+            raise ValueError("PDF 没有可预览页面")
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(150 / 72.0, 150 / 72.0),
+                                alpha=False)
+        out = os.path.join(video_dir, "page_01.png")
+        pix.save(out)
+        return out
+    finally:
+        doc.close()
+
+
 def create_title_card(video_dir, font_path, title, subtitle, feature,
-                      feature2, feature3, tagline, width=W, height=H):
+                      feature2, feature3, tagline, width=W, height=H,
+                      title_style="classic", font_sizes=None):
     """
     自适应标题卡：随输出尺寸(width,height)缩放；
     横屏(宽>高)用「封面左·文字右」，竖屏/方形用「封面上·文字下」堆叠。
@@ -542,6 +559,8 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
 
     Wd, Ht = width, height
     base = min(Wd, Ht)
+    font_sizes = font_sizes or {}
+    custom_fonts = title_style == "custom"
     canvas = Image.new("RGB", (Wd, Ht), (25, 12, 5))
     draw = ImageDraw.Draw(canvas)
 
@@ -562,11 +581,28 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
             return ImageFont.truetype(font_path, max(10, int(px)))
         except Exception:
             return ImageFont.load_default()
-    font_large = font(base * 0.093)
-    font_mid = font(base * 0.048)
-    font_small = font(base * 0.033)
-    font_tiny = font(base * 0.026)
-    font_badge = font(base * 0.030)
+
+    def font_px(name, classic_ratio, default, low, high):
+        if not custom_fonts:
+            return base * classic_ratio
+        try:
+            value = float(font_sizes.get(name, default))
+        except Exception:
+            value = default
+        value = max(low, min(high, value))
+        return value * base / 1080.0
+
+    font_large = font(font_px("title", 0.093, 100, 40, 180))
+    font_mid = font(font_px("subtitle", 0.048, 52, 20, 100))
+    font_badge = font(font_px("badge", 0.030, 32, 16, 72))
+    if custom_fonts:
+        info_px = font_px("info", 0.030, 34, 16, 72)
+        font_small = font(info_px)
+        font_tiny = font(info_px)
+    else:
+        font_small = font(base * 0.033)
+        font_tiny = font(base * 0.026)
+    font_tagline = font(font_px("tagline", 0.026, 28, 14, 64))
 
     def draw_cover(x, y, w, h):
         cov = cover.resize((w, h), Image.LANCZOS)
@@ -580,7 +616,18 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
         canvas.paste(Image.new("RGB", (w + ip * 2, h + ip * 2), (220, 190, 140)), (x - ip, y - ip))
         canvas.paste(cov, (x, y))
 
-    def ctext(cx, y, text, fnt, fill, shadow=False):
+    def fit_text_font(text, fnt, max_width):
+        if not text or not max_width:
+            return fnt
+        b = draw.textbbox((0, 0), text, font=fnt)
+        width_now = max(1, b[2] - b[0])
+        size_now = getattr(fnt, "size", 10)
+        if width_now <= max_width or size_now <= 10:
+            return fnt
+        return font(max(10, int(size_now * max_width / width_now * 0.96)))
+
+    def ctext(cx, y, text, fnt, fill, shadow=False, max_width=None):
+        fnt = fit_text_font(text, fnt, max_width)
         b = draw.textbbox((0, 0), text, font=fnt)
         tw, th = b[2] - b[0], b[3] - b[1]
         x = int(cx - tw / 2)
@@ -590,20 +637,23 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
         draw.text((x, y), text, font=fnt, fill=fill)
         return th
 
-    def draw_badges(cx, y):
+    def draw_badges(cx, y, max_width):
         """在中心 cx 处从 y 起，居中堆叠 feature/feature2/feature3，返回新 y。"""
         if feature:
-            b = draw.textbbox((0, 0), feature, font=font_badge)
+            badge_fnt = fit_text_font(feature, font_badge, max_width * 0.88)
+            b = draw.textbbox((0, 0), feature, font=badge_fnt)
             tw, th = b[2] - b[0], b[3] - b[1]
             pad = max(8, int(base * 0.014))
             draw.rectangle([cx - tw // 2 - pad, y - 5, cx + tw // 2 + pad, y + th + 10],
                            fill=(160, 50, 40))
-            ctext(cx, y, feature, font_badge, (255, 230, 180))
+            ctext(cx, y, feature, badge_fnt, (255, 230, 180), max_width=max_width)
             y += th + int(base * 0.032)
         if feature2:
-            y += ctext(cx, y, feature2, font_small, (255, 200, 100)) + int(base * 0.02)
+            y += ctext(cx, y, feature2, font_small, (255, 200, 100),
+                       max_width=max_width) + int(base * 0.02)
         if feature3:
-            y += ctext(cx, y, feature3, font_tiny, (200, 170, 120)) + int(base * 0.02)
+            y += ctext(cx, y, feature3, font_tiny, (200, 170, 120),
+                       max_width=max_width) + int(base * 0.02)
         return y
 
     title = title or "大众电影"
@@ -634,15 +684,17 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
                          fill=(200, 170, 100))
 
         y = int(Ht * 0.204)
-        y += ctext(cx, y, title, font_large, (255, 210, 130), shadow=True) + int(Ht * 0.037)
+        y += ctext(cx, y, title, font_large, (255, 210, 130), shadow=True,
+                   max_width=right_w * 0.94) + int(Ht * 0.037)
         if subtitle:
-            y += ctext(cx, y, subtitle, font_mid, (220, 220, 220)) + int(Ht * 0.028)
+            y += ctext(cx, y, subtitle, font_mid, (220, 220, 220),
+                       max_width=right_w * 0.94) + int(Ht * 0.028)
             draw.line([(right_x + int(right_w * 0.1), y), (right_x + right_w - int(right_w * 0.1), y)],
                       fill=(180, 150, 90), width=2)
             y += int(Ht * 0.03)
         else:
             y += int(Ht * 0.02)
-        draw_badges(cx, y)
+        draw_badges(cx, y, right_w * 0.94)
         tag_center = cx
         tag_lw = right_w
         tag_x0 = right_x
@@ -663,10 +715,12 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
         draw.line([(cx - lw // 2, y), (cx + lw // 2, y)],
                   fill=(200, 170, 100), width=max(2, int(base * 0.003)))
         y += int(Ht * 0.02)
-        y += ctext(cx, y, title, font_large, (255, 210, 130), shadow=True) + int(Ht * 0.022)
+        y += ctext(cx, y, title, font_large, (255, 210, 130), shadow=True,
+                   max_width=Wd * 0.9) + int(Ht * 0.022)
         if subtitle:
-            y += ctext(cx, y, subtitle, font_mid, (220, 220, 220)) + int(Ht * 0.022)
-        draw_badges(cx, y)
+            y += ctext(cx, y, subtitle, font_mid, (220, 220, 220),
+                       max_width=Wd * 0.9) + int(Ht * 0.022)
+        draw_badges(cx, y, Wd * 0.9)
         tag_center = cx
         tag_lw = int(Wd * 0.7)
         tag_x0 = cx - tag_lw // 2
@@ -676,7 +730,8 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
         draw.line([(tag_x0 + int(tag_lw * 0.15), y_tag - int(Ht * 0.028)),
                    (tag_x0 + tag_lw - int(tag_lw * 0.15), y_tag - int(Ht * 0.028))],
                   fill=(200, 170, 100), width=2)
-        ctext(tag_center, y_tag, tagline, font_tiny, (180, 160, 120))
+        ctext(tag_center, y_tag, tagline, font_tagline, (180, 160, 120),
+              max_width=tag_lw * 0.9)
 
     canvas.save(title_path, quality=95)
     return title_path
@@ -1207,6 +1262,10 @@ def build_srt(narration, clip_durations, raw_durs, title_duration):
     return build_srt_from_cues(cues)
 
 
+class _TranslationCountError(RuntimeError):
+    pass
+
+
 def _parse_translation_json(raw, expected):
     text = (raw or "").strip()
     if text.startswith("```"):
@@ -1221,7 +1280,7 @@ def _parse_translation_json(raw, expected):
     except Exception as e:
         raise RuntimeError(f"AI 翻译返回 JSON 解析失败: {e}") from e
     if not isinstance(values, list) or len(values) != expected:
-        raise RuntimeError(
+        raise _TranslationCountError(
             f"AI 翻译返回数量不匹配：需要 {expected} 条，实际 {len(values) if isinstance(values, list) else 0} 条")
     return [re.sub(r"\s+", " ", str(x or "")).strip() for x in values]
 
@@ -1240,28 +1299,25 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
     is_nvidia = provider == "nvidia"
     min_interval = 1.65 if is_nvidia else 0.0
     next_allowed_at = 0.0
-    batch_size = 16
-    translated = []
-    total_batches = (len(cues) + batch_size - 1) // batch_size
+    batch_size = 8
+    completed = 0
     system_msg = (
         "You translate Chinese video subtitles into concise, natural English. "
         "Keep names and facts accurate. Return only a JSON array of strings, "
         "with exactly one English translation for each input item, preserving order."
     )
-    for batch_index, start in enumerate(range(0, len(cues), batch_size)):
-        batch = [c["text"] for c in cues[start:start + batch_size]]
-        if is_nvidia:
-            wait = max(0.0, next_allowed_at - time.time())
-            if wait > 0:
-                if progress_cb:
-                    progress_cb("translate", batch_index / max(1, total_batches),
-                                f"NVIDIA 翻译节流等待 {wait:.1f}s")
-                time.sleep(wait)
-
+    def translate_batch(batch, label):
+        nonlocal next_allowed_at, completed
+        attempts = 3
         last_err = ""
-        attempts = 3 if is_nvidia else 1
         for attempt in range(1, attempts + 1):
             if is_nvidia:
+                wait = max(0.0, next_allowed_at - time.time())
+                if wait > 0:
+                    if progress_cb:
+                        progress_cb("translate", completed / max(1, len(cues)),
+                                    f"NVIDIA 翻译节流等待 {wait:.1f}s")
+                    time.sleep(wait)
                 next_allowed_at = max(next_allowed_at, time.time()) + min_interval
             try:
                 raw = _call_openai_chat(
@@ -1269,23 +1325,37 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
                     [{"role": "system", "content": system_msg},
                      {"role": "user", "content": json.dumps(batch, ensure_ascii=False)}],
                     temperature=0.1,
-                    max_tokens=min(4096, max(1024, len(batch) * 160)),
+                    max_tokens=min(4096, max(1024, len(batch) * 240)),
                     timeout=180,
                 )
-                translated.extend(_parse_translation_json(raw, len(batch)))
-                break
+                result = _parse_translation_json(raw, len(batch))
+                completed += len(result)
+                if progress_cb:
+                    progress_cb("translate", completed / max(1, len(cues)),
+                                f"AI 翻译英文字幕 {completed}/{len(cues)} 条")
+                return result
+            except _TranslationCountError as e:
+                last_err = str(e)
+                if len(batch) > 1:
+                    mid = len(batch) // 2
+                    print(f"    AI 字幕翻译 {label} 返回数量不完整，拆分为 {mid}+{len(batch)-mid} 条重试")
+                    return (translate_batch(batch[:mid], label + "A") +
+                            translate_batch(batch[mid:], label + "B"))
             except Exception as e:
                 last_err = str(e)
-                if (is_nvidia and _is_retryable_llm_error(last_err)
-                        and attempt < attempts):
-                    sleep_s = min(15.0, 1.7 * (2 ** (attempt - 1)))
-                    time.sleep(sleep_s)
-                    continue
-                raise RuntimeError(
-                    f"AI 英文字幕翻译失败（第 {batch_index + 1}/{total_batches} 批）: {last_err}") from e
-        if progress_cb:
-            progress_cb("translate", (batch_index + 1) / max(1, total_batches),
-                        f"AI 翻译英文字幕 {min(start + len(batch), len(cues))}/{len(cues)} 条")
+
+            if attempt < attempts:
+                retryable = _is_retryable_llm_error(last_err)
+                sleep_s = min(12.0, (1.7 if retryable else 0.8) * (2 ** (attempt - 1)))
+                time.sleep(sleep_s)
+                continue
+            raise RuntimeError(f"AI 英文字幕翻译失败（{label}）: {last_err}")
+        raise RuntimeError(f"AI 英文字幕翻译失败（{label}）: {last_err}")
+
+    translated = []
+    for batch_index, start in enumerate(range(0, len(cues), batch_size), start=1):
+        batch = [c["text"] for c in cues[start:start + batch_size]]
+        translated.extend(translate_batch(batch, f"第 {batch_index} 批"))
     return translated
 
 
@@ -1501,7 +1571,8 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
         params.get("title", "大众电影"), params.get("subtitle", ""),
         params.get("feature", ""), params.get("feature2", ""),
         params.get("feature3", ""), params.get("tagline", ""),
-        Wd, Ht)
+        Wd, Ht, params.get("title_card_style", "classic"),
+        params.get("title_font_sizes") or {})
 
     # Step 4: 先合成旁白（测得每段真实时长，供“自动延长片段时长”使用）
     if progress_cb:

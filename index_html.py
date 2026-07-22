@@ -55,6 +55,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .ok { color:#7ed18a; }
   .err { color:#e88a7a; }
   a.dl { color:#ffd28a; text-decoration:none; font-weight:600; }
+  .title-preview-layout { display:grid; grid-template-columns:minmax(260px,.85fr) minmax(320px,1.15fr);
+                          gap:16px; align-items:start; margin-top:12px; }
+  .title-preview-frame { min-height:190px; display:flex; align-items:center; justify-content:center;
+                         background:#140f0b; border:1px solid #4a3a2a; border-radius:6px;
+                         overflow:hidden; position:relative; }
+  #title-preview-image { display:block; width:100%; height:auto; max-height:420px; object-fit:contain; }
+  #title-preview-status { position:absolute; inset:0; display:flex; align-items:center;
+                          justify-content:center; color:#8c7c63; font-size:12px; }
+  @media (max-width:700px) {
+    .title-preview-layout { grid-template-columns:1fr; }
+    .grid2,.grid3 { grid-template-columns:1fr; }
+  }
 </style>
 </head>
 <body>
@@ -166,6 +178,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div><label>副信息2</label><input type="text" id="feature3" placeholder="如 《开国大典》《本命年》"></div>
       <div><label>标语</label><input type="text" id="tagline" value="怀旧时光之旅"></div>
     </div>
+    <div class="title-preview-layout">
+      <div>
+        <label>封面版式</label>
+        <select id="title_card_style">
+          <option value="classic" selected>经典自动版式（当前）</option>
+          <option value="custom">自定义字号</option>
+        </select>
+        <div id="title-font-controls" class="grid2" style="display:none;margin-top:6px;">
+          <div><label>主标题字号</label><input type="number" id="title_font_title" value="100" min="40" max="180" step="2"></div>
+          <div><label>副标题字号</label><input type="number" id="title_font_subtitle" value="52" min="20" max="100" step="2"></div>
+          <div><label>徽标字号</label><input type="number" id="title_font_badge" value="32" min="16" max="72" step="2"></div>
+          <div><label>副信息字号</label><input type="number" id="title_font_info" value="34" min="16" max="72" step="2"></div>
+          <div><label>标语字号</label><input type="number" id="title_font_tagline" value="28" min="14" max="64" step="2"></div>
+        </div>
+      </div>
+      <div class="title-preview-frame">
+        <img id="title-preview-image" alt="封面预览">
+        <div id="title-preview-status">封面预览将在文字提取完成后显示</div>
+      </div>
+    </div>
     <div class="grid2" style="margin-top:8px;">
       <div><label>配音声音</label><select id="voice"></select></div>
       <div><label>语速</label><select id="rate"></select></div>
@@ -235,6 +267,7 @@ const $ = id => document.getElementById(id);
 const AI_CFG_KEY = 'mk_dzdy_ai_cfg_v1';
 const OCR_CFG_KEY = 'mk_dzdy_ocr_cfg_v1';
 const SUBTITLE_CFG_KEY = 'mk_dzdy_subtitle_cfg_v1';
+const TITLE_CFG_KEY = 'mk_dzdy_title_cfg_v1';
 
 function loadAiCfg(){
   try { return JSON.parse(localStorage.getItem(AI_CFG_KEY) || '{}') || {}; }
@@ -281,6 +314,20 @@ function updateSubtitleUi(){
   $('subtitle-style').style.display = burn ? '' : 'none';
   $('subtitle-style-hint').style.display = burn ? '' : 'none';
   $('subtitle-en-color-wrap').style.display = mode === 'burn_bilingual' ? '' : 'none';
+}
+function saveTitleCfg(){
+  const data = {title_card_style:$('title_card_style').value};
+  ['title_font_title','title_font_subtitle','title_font_badge','title_font_info','title_font_tagline']
+    .forEach(id=>data[id]=$(id).value);
+  try { localStorage.setItem(TITLE_CFG_KEY, JSON.stringify(data)); }
+  catch(e){}
+}
+function loadTitleCfg(){
+  try { return JSON.parse(localStorage.getItem(TITLE_CFG_KEY) || '{}') || {}; }
+  catch(e){ return {}; }
+}
+function updateTitleControls(){
+  $('title-font-controls').style.display = $('title_card_style').value === 'custom' ? '' : 'none';
 }
 const NARR_SAVE_TIMERS = {};
 function saveNarrationSegment(idx, text){
@@ -351,6 +398,10 @@ const savedSubtitleCfg = loadSubtitleCfg();
 });
 updateSubtitleUi();
 syncAiCfgUi();
+const savedTitleCfg = loadTitleCfg();
+['title_card_style','title_font_title','title_font_subtitle','title_font_badge','title_font_info','title_font_tagline']
+  .forEach(id=>{ if(savedTitleCfg[id] !== undefined) $(id).value=savedTitleCfg[id]; });
+updateTitleControls();
 
 // 填充声音/语速
 fetch('/api/voices').then(r=>r.json()).then(d=>{
@@ -396,6 +447,56 @@ function updateDimHint(){
 });
 updateDimHint();
 
+let TITLE_PREVIEW_TIMER=null, TITLE_PREVIEW_SEQ=0, TITLE_PREVIEW_URL='';
+function titlePreviewPayload(){
+  return {
+    task_id:TASK_ID,
+    title:$('title').value, subtitle:$('subtitle').value,
+    feature:$('feature').value, feature2:$('feature2').value,
+    feature3:$('feature3').value, tagline:$('tagline').value,
+    aspect:$('aspect').value, custom_w:$('custom_w').value,
+    custom_h:$('custom_h').value, quality:$('quality').value,
+    title_card_style:$('title_card_style').value,
+    title_font_title:$('title_font_title').value,
+    title_font_subtitle:$('title_font_subtitle').value,
+    title_font_badge:$('title_font_badge').value,
+    title_font_info:$('title_font_info').value,
+    title_font_tagline:$('title_font_tagline').value,
+  };
+}
+function scheduleTitlePreview(delay=280){
+  if(!TASK_ID) return;
+  if(TITLE_PREVIEW_TIMER) clearTimeout(TITLE_PREVIEW_TIMER);
+  TITLE_PREVIEW_TIMER=setTimeout(refreshTitlePreview,delay);
+}
+async function refreshTitlePreview(){
+  if(!TASK_ID) return;
+  const seq=++TITLE_PREVIEW_SEQ;
+  const status=$('title-preview-status');
+  status.style.display='flex'; status.textContent='正在生成封面预览…';
+  try{
+    const r=await fetch('/api/title_preview',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(titlePreviewPayload())
+    });
+    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.error||'预览失败'); }
+    const blob=await r.blob();
+    if(seq!==TITLE_PREVIEW_SEQ) return;
+    if(TITLE_PREVIEW_URL) URL.revokeObjectURL(TITLE_PREVIEW_URL);
+    TITLE_PREVIEW_URL=URL.createObjectURL(blob);
+    $('title-preview-image').src=TITLE_PREVIEW_URL;
+    status.style.display='none';
+  }catch(e){
+    if(seq===TITLE_PREVIEW_SEQ){ status.textContent='封面预览失败: '+e.message; }
+  }
+}
+['title','subtitle','feature','feature2','feature3','tagline','aspect','quality','custom_w','custom_h',
+ 'title_card_style','title_font_title','title_font_subtitle','title_font_badge','title_font_info','title_font_tagline']
+ .forEach(id=>{
+   $(id).addEventListener('input',()=>{ updateTitleControls(); saveTitleCfg(); scheduleTitlePreview(); });
+   $(id).addEventListener('change',()=>{ updateTitleControls(); saveTitleCfg(); scheduleTitlePreview(80); });
+ });
+
 // 载入并提取
 $('btn-prepare').onclick=()=>{
   if(!window._file){ alert('请先选择 PDF 文件'); return; }
@@ -436,6 +537,7 @@ function pollPrepare(){
       $('card-nar').style.display='block';
       $('card-opt').style.display='block';
       $('status1').innerHTML='<span class="ok">文字提取完成！可编辑旁白后点“生成视频”。</span>';
+      scheduleTitlePreview(0);
       return;
     }
     if(st.stage==='error'){ $('status1').innerHTML='<span class="err">'+st.message+'</span>'; return; }
@@ -498,6 +600,12 @@ $('btn-generate').onclick=()=>{
     llm_base_url:$('llm_base_url').value,
     llm_api_key:$('llm_api_key').value,
     llm_model:$('llm_model').value,
+    title_card_style:$('title_card_style').value,
+    title_font_title:$('title_font_title').value,
+    title_font_subtitle:$('title_font_subtitle').value,
+    title_font_badge:$('title_font_badge').value,
+    title_font_info:$('title_font_info').value,
+    title_font_tagline:$('title_font_tagline').value,
     title:$('title').value, subtitle:$('subtitle').value,
     feature:$('feature').value, feature2:$('feature2').value,
     feature3:$('feature3').value, tagline:$('tagline').value,
