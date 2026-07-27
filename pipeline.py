@@ -967,7 +967,7 @@ def _clean_ai_text(text):
     lines = [ln for ln in lines if ln]
     s = " ".join(lines).strip()
     s = re.sub(r"\s+", " ", s)
-    return s.strip(" \t\r\n\"'。")
+    return s.strip(" \t\r\n\"'")
 
 
 def _is_retryable_llm_error(err_text):
@@ -977,18 +977,6 @@ def _is_retryable_llm_error(err_text):
         "http 500", "http 502", "http 503", "http 504",
         "temporarily unavailable", "timeout",
     ))
-
-
-def _limit_narration_length(text, max_chars):
-    """Keep a narration near the requested size without cutting mid-sentence."""
-    text = (text or "").strip()
-    if len(text) <= max_chars:
-        return text
-    window = text[:max_chars]
-    cut = max(window.rfind(mark) for mark in "。！？!?；;")
-    if cut >= int(max_chars * 0.6):
-        return window[:cut + 1].strip()
-    return window.rstrip("，、；;：: ") + "。"
 
 
 def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
@@ -1003,12 +991,12 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
     api_key = (llm_cfg or {}).get("api_key", "")
     model = (llm_cfg or {}).get("model", "")
     try:
-        target_chars = int((llm_cfg or {}).get("narration_target_chars", 80))
+        target_chars = int((llm_cfg or {}).get("narration_target_chars", 200))
     except (TypeError, ValueError):
-        target_chars = 80
-    target_chars = max(40, min(200, target_chars))
+        target_chars = 200
+    target_chars = max(40, min(400, target_chars))
     min_chars = max(30, int(round(target_chars * 0.75)))
-    max_chars = min(240, max(min_chars + 10, int(round(target_chars * 1.15))))
+    max_chars = min(480, max(min_chars + 10, int(round(target_chars * 1.15))))
     if not enabled:
         return fallback_clips, ""
     if not base_url or not model:
@@ -1050,8 +1038,8 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
         )
         user_msg = (
             f"这是第 {i + 1}/{clip_count} 个片段。"
-            f"请将以下材料提炼为约 {target_chars} 个汉字的中文口播旁白，严格控制在 {min_chars} 到 {max_chars} 个汉字，写 2 到 3 句。"
-            "优先讲清核心内容和意义，不要罗列细节，不要照抄长句。\n"
+            f"请将以下材料提炼为约 {target_chars} 个汉字的中文口播旁白，尽量控制在 {min_chars} 到 {max_chars} 个汉字，写 3 到 5 句。"
+            "优先讲清核心内容和意义，不要罗列细节，不要照抄长句。必须完整收尾，绝对不要为了满足字数而截断句子。\n"
             "OCR 材料：\n" + "\n".join(parts)
         )
 
@@ -1095,7 +1083,13 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                         + "\n".join(parts)
                     )
                     continue
-                text = _limit_narration_length(text, max_chars)
+                if len(candidate) > max_chars and attempt < 3:
+                    user_msg = (
+                        f"上一次旁白有 {len(candidate)} 个字符，内容过长。请在不丢失核心事实的前提下压缩到 "
+                        f"{min_chars} 到 {max_chars} 个汉字，保持每句话完整并补上句末标点。只输出旁白正文。\n"
+                        "OCR 材料：\n" + "\n".join(parts)
+                    )
+                    continue
                 out.append(text)
                 ok = True
                 break

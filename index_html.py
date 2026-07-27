@@ -133,7 +133,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
         <div style="margin-top:8px;max-width:220px;">
           <label>每段AI旁白目标字数</label>
-          <input type="number" id="narration_target_chars" value="80" min="40" max="200" step="10">
+          <input type="number" id="narration_target_chars" value="200" min="40" max="400" step="10">
         </div>
         <div class="hint" id="ai-provider-hint">开启后，系统会先根据每个片段的 OCR 文本生成旁白，再继续后面的配音流程。</div>
       </div>
@@ -290,6 +290,7 @@ function saveAiCfg(){
     llm_api_key: $('llm_api_key').value,
     llm_model: $('llm_model').value,
     narration_target_chars: $('narration_target_chars').value,
+    narration_target_chars_version: 2,
   };
   try { localStorage.setItem(AI_CFG_KEY, JSON.stringify(data)); }
   catch(e){}
@@ -387,7 +388,10 @@ if (savedAiCfg) {
   if (savedAiCfg.llm_base_url !== undefined) $('llm_base_url').value = savedAiCfg.llm_base_url;
   if (savedAiCfg.llm_api_key !== undefined) $('llm_api_key').value = savedAiCfg.llm_api_key;
   if (savedAiCfg.llm_model !== undefined) $('llm_model').value = savedAiCfg.llm_model;
-  if (savedAiCfg.narration_target_chars !== undefined) $('narration_target_chars').value = savedAiCfg.narration_target_chars;
+  if (savedAiCfg.narration_target_chars !== undefined &&
+      !(Number(savedAiCfg.narration_target_chars) === 80 && !savedAiCfg.narration_target_chars_version)) {
+    $('narration_target_chars').value = savedAiCfg.narration_target_chars;
+  }
 }
 syncAiCfgUi();
 ['use_ai_narration','use_ai_ocr','llm_provider','llm_base_url','llm_api_key','llm_model','narration_target_chars'].forEach(id=>{

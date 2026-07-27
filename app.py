@@ -231,10 +231,10 @@ def api_prepare():
     if use_ai_narration or use_ai_ocr:
         use_ocr = True
     try:
-        narration_target_chars = int(request.form.get("narration_target_chars", 80))
+        narration_target_chars = int(request.form.get("narration_target_chars", 200))
     except (TypeError, ValueError):
-        narration_target_chars = 80
-    narration_target_chars = max(40, min(200, narration_target_chars))
+        narration_target_chars = 200
+    narration_target_chars = max(40, min(400, narration_target_chars))
     llm_common = {
         "provider": request.form.get("llm_provider", "openai").strip().lower(),
         "base_url": request.form.get("llm_base_url", "").strip(),
@@ -335,9 +335,9 @@ def api_regenerate_narration():
         return jsonify({"error": "当前任务没有可复用的提取文字，请重新载入 PDF"}), 400
 
     try:
-        target_chars = int(data.get("narration_target_chars", 80))
+        target_chars = int(data.get("narration_target_chars", 200))
     except (TypeError, ValueError):
-        target_chars = 80
+        target_chars = 200
     llm_cfg = {
         "enabled": True,
         "provider": str(data.get("llm_provider") or
@@ -348,7 +348,7 @@ def api_regenerate_narration():
                        stored_cfg.get("api_key") or "").strip(),
         "model": str(data.get("llm_model") or
                      stored_cfg.get("model") or "").strip(),
-        "narration_target_chars": max(40, min(200, target_chars)),
+        "narration_target_chars": max(40, min(400, target_chars)),
     }
     if llm_cfg["provider"] not in ("openai", "nvidia"):
         llm_cfg["provider"] = "openai"
