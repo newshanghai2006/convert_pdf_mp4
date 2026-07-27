@@ -979,6 +979,18 @@ def _is_retryable_llm_error(err_text):
     ))
 
 
+def _limit_narration_length(text, max_chars):
+    """Keep a narration near the requested size without cutting mid-sentence."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    cut = max(window.rfind(mark) for mark in "。！？!?；;")
+    if cut >= int(max_chars * 0.6):
+        return window[:cut + 1].strip()
+    return window.rstrip("，、；;：: ") + "。"
+
+
 def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                           progress_cb=None):
     """
@@ -990,6 +1002,13 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
     base_url = (llm_cfg or {}).get("base_url", "")
     api_key = (llm_cfg or {}).get("api_key", "")
     model = (llm_cfg or {}).get("model", "")
+    try:
+        target_chars = int((llm_cfg or {}).get("narration_target_chars", 80))
+    except (TypeError, ValueError):
+        target_chars = 80
+    target_chars = max(40, min(200, target_chars))
+    min_chars = max(30, int(round(target_chars * 0.75)))
+    max_chars = min(240, max(min_chars + 10, int(round(target_chars * 1.15))))
     if not enabled:
         return fallback_clips, ""
     if not base_url or not model:
@@ -1012,14 +1031,6 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
             failures += 1
             continue
 
-        if is_nvidia:
-            wait = max(0.0, next_allowed_at - time.time())
-            if wait > 0:
-                if progress_cb:
-                    progress_cb("ai", 0.55 + 0.35 * i / max(1, clip_count),
-                                f"NVIDIA 模式节流等待 {wait:.1f}s")
-                time.sleep(wait)
-
         parts = []
         for j, text in enumerate(pages, start=start + 1):
             label = "封面" if j == 1 else f"第{j}页"
@@ -1029,20 +1040,30 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
             parts.append(f"{label}：{txt}")
 
         sys_msg = (
-            "你是中文杂志解说视频的旁白编写助手。"
-            "请根据给定页面 OCR 文本写一段适合口播的旁白，语气自然、信息准确、简洁流畅。"
-            "如果第1页是封面，只把它当作封面参考，不要逐字复述封面标题。"
-            "只输出最终旁白正文，不要编号、标题、项目符号、解释或前后缀。"
+            "你是资深中文杂志编辑和解说视频文案作者。输入是可能含错字、乱码、重复行和版面乱序的 OCR 文本。"
+            "你的任务不是校对、摘抄或逐句改写原文，而是先理解主题，再提炼最值得讲述的核心信息，重写成自然口语旁白。"
+            "选择二到四个关键事实，理清人物、事件和因果关系；忽略页码、栏目名、广告、乱码及重复内容。"
+            "可以修正有明确上下文依据的 OCR 错字；无法确认的信息直接省略，禁止杜撰。"
+            "旁白不要出现‘本页’‘页面’‘文章’‘OCR’‘原文提到’等元话语，也不要大段照抄输入。"
+            "如果第1页是封面，只把它当作背景参考，不要复述封面文字。"
+            "只输出一段最终旁白正文，不要标题、编号、项目符号、解释或前后缀。"
         )
         user_msg = (
             f"这是第 {i + 1}/{clip_count} 个片段。"
-            "请写 1 到 2 句中文旁白，长度大约 60 到 120 个汉字。"
-            "页面 OCR 如下：\n" + "\n".join(parts)
+            f"请将以下材料提炼为约 {target_chars} 个汉字的中文口播旁白，严格控制在 {min_chars} 到 {max_chars} 个汉字，写 2 到 3 句。"
+            "优先讲清核心内容和意义，不要罗列细节，不要照抄长句。\n"
+            "OCR 材料：\n" + "\n".join(parts)
         )
 
         ok = False
         for attempt in range(1, 4):
             if is_nvidia:
+                wait = max(0.0, next_allowed_at - time.time())
+                if wait > 0:
+                    if progress_cb:
+                        progress_cb("ai", 0.55 + 0.35 * i / max(1, clip_count),
+                                    f"NVIDIA 模式节流等待 {wait:.1f}s")
+                    time.sleep(wait)
                 next_allowed_at = max(next_allowed_at, time.time()) + min_interval
             try:
                 raw = _call_openai_chat(
@@ -1056,6 +1077,25 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                 text = _clean_ai_text(raw)
                 if not text:
                     raise RuntimeError("LLM 返回内容为空")
+                source = re.sub(r"\s+", "", "".join(pages))
+                candidate = re.sub(r"\s+", "", text)
+                if len(candidate) >= min_chars and candidate in source:
+                    if attempt < 3:
+                        user_msg = (
+                            f"上一次输出仍在照抄 OCR。请重新理解并概括，只保留核心事实，用全新的口语表达，"
+                            f"控制在 {min_chars} 到 {max_chars} 个汉字。只输出旁白正文。\nOCR 材料：\n"
+                            + "\n".join(parts)
+                        )
+                        continue
+                    raise RuntimeError("LLM 连续返回 OCR 摘抄，未生成合格的提炼旁白")
+                if len(candidate) < min_chars and attempt < 3:
+                    user_msg = (
+                        f"上一次旁白只有 {len(candidate)} 个字符，信息过少。请保留核心事实并补足必要背景，"
+                        f"重写为 {min_chars} 到 {max_chars} 个汉字。只输出旁白正文。\nOCR 材料：\n"
+                        + "\n".join(parts)
+                    )
+                    continue
+                text = _limit_narration_length(text, max_chars)
                 out.append(text)
                 ok = True
                 break
@@ -1080,9 +1120,14 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                         f"AI 生成旁白 {i + 1}/{clip_count}")
 
     if failures:
-        note = "AI 旁白已生成，但部分片段回退为原始文本"
+        reason = re.sub(r"\s+", " ", last_err).strip()[:240]
+        note = f"AI 旁白有 {failures}/{clip_count} 段失败，失败片段已保留原始 OCR 文本"
+        if reason:
+            note += f"；最后错误：{reason}"
         if failures >= clip_count:
-            note = "AI 旁白生成失败，已保留原始 OCR 文本"
+            note = "AI 旁白全部生成失败，已保留原始 OCR 文本"
+            if reason:
+                note += f"；错误：{reason}"
             if last_err:
                 print(f"  AI 旁白最终失败: {last_err}")
         return out, note

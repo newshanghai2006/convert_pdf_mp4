@@ -104,6 +104,10 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
             ocr_lang=ocr_lang, probe_ocr=probe_ocr, ai_ocr_cfg=ai_ocr_cfg,
             ocr_engine=ocr_engine)
         clips = p.group_into_clips(pages, pages_per_clip)
+        fallback_clips = list(clips)
+        update_task(tid, page_texts=pages,
+                    fallback_narration=fallback_clips,
+                    pages_per_clip=pages_per_clip)
         ai_note = ""
         if llm_cfg.get("enabled"):
             clips, ai_note = p.generate_ai_narration(
@@ -117,6 +121,21 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
                     page_count=len(pages))
     except Exception as e:
         update_task(tid, stage="error", message=f"\u63d0\u53d6\u5931\u8d25: {e}")
+
+
+def do_regenerate_narration(tid, pages, pages_per_clip, fallback_clips, llm_cfg):
+    def cb(stage, pct, msg):
+        update_task(tid, stage=stage, progress=pct, message=msg)
+
+    try:
+        clips, ai_note = _pipeline().generate_ai_narration(
+            pages, pages_per_clip, fallback_clips, llm_cfg, cb)
+        message = ai_note or "AI \u65c1\u767d\u5df2\u91cd\u65b0\u751f\u6210"
+        update_task(tid, stage="ready", progress=1.0, message=message,
+                    narration=clips, clips=len(clips), llm_cfg=llm_cfg)
+    except Exception as e:
+        update_task(tid, stage="ready", progress=1.0,
+                    message=f"AI \u65c1\u767d\u91cd\u65b0\u751f\u6210\u5931\u8d25\uff1a{e}\uff1b\u5df2\u4fdd\u7559\u5f53\u524d\u65c1\u767d")
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +230,17 @@ def api_prepare():
     use_ai_ocr = request.form.get("use_ai_ocr", "false").lower() == "true"
     if use_ai_narration or use_ai_ocr:
         use_ocr = True
+    try:
+        narration_target_chars = int(request.form.get("narration_target_chars", 80))
+    except (TypeError, ValueError):
+        narration_target_chars = 80
+    narration_target_chars = max(40, min(200, narration_target_chars))
     llm_common = {
         "provider": request.form.get("llm_provider", "openai").strip().lower(),
         "base_url": request.form.get("llm_base_url", "").strip(),
         "api_key": request.form.get("llm_api_key", "").strip(),
         "model": request.form.get("llm_model", "").strip(),
+        "narration_target_chars": narration_target_chars,
     }
     llm_cfg = dict(llm_common, enabled=use_ai_narration)
     ai_ocr_cfg = dict(llm_common, enabled=use_ai_ocr)
@@ -289,6 +314,55 @@ def api_save_narration():
             return jsonify({"error": "bad idx"}), 400
         narration[idx] = text
         st["narration"] = narration
+    return jsonify({"ok": True})
+
+
+@app.route("/api/regenerate_narration", methods=["POST"])
+def api_regenerate_narration():
+    data = request.get_json(force=True)
+    tid = data.get("task_id")
+    with TASKS_LOCK:
+        st = TASKS.get(tid)
+        if not st:
+            return jsonify({"error": "not found"}), 404
+        if st["stage"] not in ("ready", "done"):
+            return jsonify({"error": "task is busy"}), 400
+        pages = list(st.get("page_texts") or [])
+        fallback_clips = list(st.get("fallback_narration") or [])
+        pages_per_clip = int(st.get("pages_per_clip") or 1)
+        stored_cfg = dict(st.get("llm_cfg") or {})
+    if not pages or not fallback_clips:
+        return jsonify({"error": "当前任务没有可复用的提取文字，请重新载入 PDF"}), 400
+
+    try:
+        target_chars = int(data.get("narration_target_chars", 80))
+    except (TypeError, ValueError):
+        target_chars = 80
+    llm_cfg = {
+        "enabled": True,
+        "provider": str(data.get("llm_provider") or
+                        stored_cfg.get("provider") or "openai").strip().lower(),
+        "base_url": str(data.get("llm_base_url") or
+                        stored_cfg.get("base_url") or "").strip(),
+        "api_key": str(data.get("llm_api_key") or
+                       stored_cfg.get("api_key") or "").strip(),
+        "model": str(data.get("llm_model") or
+                     stored_cfg.get("model") or "").strip(),
+        "narration_target_chars": max(40, min(200, target_chars)),
+    }
+    if llm_cfg["provider"] not in ("openai", "nvidia"):
+        llm_cfg["provider"] = "openai"
+    if not llm_cfg["base_url"] or not llm_cfg["model"]:
+        return jsonify({"error": "请填写 LLM base_url 和 Model"}), 400
+
+    update_task(tid, stage="ai", progress=0.55,
+                message="正在复用已提取文字重新生成 AI 旁白，不会执行 OCR",
+                llm_cfg=llm_cfg)
+    t = threading.Thread(
+        target=do_regenerate_narration,
+        args=(tid, pages, pages_per_clip, fallback_clips, llm_cfg))
+    t.daemon = True
+    t.start()
     return jsonify({"ok": True})
 
 

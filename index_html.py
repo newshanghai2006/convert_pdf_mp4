@@ -131,6 +131,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div><label>API Key</label><input type="password" id="llm_api_key" placeholder="sk-..."></div>
           <div><label>Model</label><input type="text" id="llm_model" placeholder="gpt-4o-mini"></div>
         </div>
+        <div style="margin-top:8px;max-width:220px;">
+          <label>每段AI旁白目标字数</label>
+          <input type="number" id="narration_target_chars" value="80" min="40" max="200" step="10">
+        </div>
         <div class="hint" id="ai-provider-hint">开启后，系统会先根据每个片段的 OCR 文本生成旁白，再继续后面的配音流程。</div>
       </div>
     </div>
@@ -164,6 +168,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="card" id="card-nar" style="display:none;">
     <h2>② 编辑旁白 <span class="pill" id="clip-pill">0 段</span></h2>
     <div class="hint" style="margin-bottom:10px;">每块 = 一个视频片段：左侧改旁白，右上「时长(秒)」可单独设置该片段时长（默认同步①里的每片段时长；开了「自动延长」则此值作为该片段的<b>最短</b>时长）。</div>
+    <div class="btn-row" style="margin-bottom:10px;">
+      <button class="btn-2" id="btn-regenerate-ai">重新生成AI旁白</button>
+      <span class="hint">复用已提取文字，不会重新执行 OCR</span>
+    </div>
     <div id="nar-list"></div>
   </div>
 
@@ -281,6 +289,7 @@ function saveAiCfg(){
     llm_base_url: $('llm_base_url').value,
     llm_api_key: $('llm_api_key').value,
     llm_model: $('llm_model').value,
+    narration_target_chars: $('narration_target_chars').value,
   };
   try { localStorage.setItem(AI_CFG_KEY, JSON.stringify(data)); }
   catch(e){}
@@ -353,7 +362,7 @@ function syncAiCfgUi(){
   if (aiPipelineOn) $('use_ocr').checked = true;
   $('use_ocr').disabled = aiPipelineOn;
   $('ocr_engine').disabled = aiOcrOn;
-  ['llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
+  ['llm_provider','llm_base_url','llm_api_key','llm_model','narration_target_chars'].forEach(id=>{
     const el=$(id);
     if(el) el.disabled = !configOn;
   });
@@ -378,9 +387,10 @@ if (savedAiCfg) {
   if (savedAiCfg.llm_base_url !== undefined) $('llm_base_url').value = savedAiCfg.llm_base_url;
   if (savedAiCfg.llm_api_key !== undefined) $('llm_api_key').value = savedAiCfg.llm_api_key;
   if (savedAiCfg.llm_model !== undefined) $('llm_model').value = savedAiCfg.llm_model;
+  if (savedAiCfg.narration_target_chars !== undefined) $('narration_target_chars').value = savedAiCfg.narration_target_chars;
 }
 syncAiCfgUi();
-['use_ai_narration','use_ai_ocr','llm_provider','llm_base_url','llm_api_key','llm_model'].forEach(id=>{
+['use_ai_narration','use_ai_ocr','llm_provider','llm_base_url','llm_api_key','llm_model','narration_target_chars'].forEach(id=>{
   const el=$(id);
   if(!el) return;
   el.addEventListener('change', ()=>{ syncAiCfgUi(); saveAiCfg(); });
@@ -512,6 +522,7 @@ $('btn-prepare').onclick=()=>{
   fd.append('llm_base_url', $('llm_base_url').value);
   fd.append('llm_api_key', $('llm_api_key').value);
   fd.append('llm_model', $('llm_model').value);
+  fd.append('narration_target_chars', $('narration_target_chars').value);
   fd.append('page_range', $('page_range').value);
   fd.append('ocr_lang', $('ocr_lang').value);
   $('status1').textContent='上传中…';
@@ -536,7 +547,12 @@ function pollPrepare(){
       renderNarration(st.narration);
       $('card-nar').style.display='block';
       $('card-opt').style.display='block';
-      $('status1').innerHTML='<span class="ok">文字提取完成！可编辑旁白后点“生成视频”。</span>';
+      $('status1').textContent='';
+      const ready=document.createElement('span');
+      const aiFailed=(st.message||'').includes('AI 旁白') && (st.message||'').includes('失败');
+      ready.className=aiFailed?'err':'ok';
+      ready.textContent=(st.message||'文字提取完成')+'。可编辑旁白后点“生成视频”。';
+      $('status1').appendChild(ready);
       scheduleTitlePreview(0);
       return;
     }
@@ -544,6 +560,32 @@ function pollPrepare(){
     setTimeout(pollPrepare, 1000);
   });
 }
+
+$('btn-regenerate-ai').onclick=()=>{
+  if(!TASK_ID) return;
+  if(!$('llm_base_url').value.trim() || !$('llm_model').value.trim()){
+    alert('请先填写 LLM base_url 和 Model'); return;
+  }
+  if(!confirm('将使用原始提取文字覆盖当前旁白，确定重新生成吗？')) return;
+  saveAiCfg();
+  const payload={
+    task_id:TASK_ID,
+    llm_provider:$('llm_provider').value,
+    llm_base_url:$('llm_base_url').value,
+    llm_api_key:$('llm_api_key').value,
+    llm_model:$('llm_model').value,
+    narration_target_chars:$('narration_target_chars').value,
+  };
+  $('status1').textContent='正在提交AI旁白重写任务…';
+  fetch('/api/regenerate_narration',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).then(async r=>{
+    const result=await r.json();
+    if(!r.ok) throw new Error(result.error||'AI旁白重写请求失败');
+    pollPrepare();
+  }).catch(err=>{ $('status1').textContent=err.message; });
+};
 
 function renderNarration(arr){
   $('clip-pill').textContent=arr.length+' 段';
