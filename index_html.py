@@ -258,6 +258,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="bar"><i id="bar2"></i></div>
     <div id="status2"></div>
+    <div id="applied-audio" class="hint"></div>
   </div>
 
   <!-- 4. 结果 -->
@@ -276,6 +277,7 @@ const AI_CFG_KEY = 'mk_dzdy_ai_cfg_v1';
 const OCR_CFG_KEY = 'mk_dzdy_ocr_cfg_v1';
 const SUBTITLE_CFG_KEY = 'mk_dzdy_subtitle_cfg_v1';
 const TITLE_CFG_KEY = 'mk_dzdy_title_cfg_v1';
+const AUDIO_CFG_KEY = 'mk_dzdy_audio_cfg_v1';
 
 function loadAiCfg(){
   try { return JSON.parse(localStorage.getItem(AI_CFG_KEY) || '{}') || {}; }
@@ -317,6 +319,15 @@ function saveSubtitleCfg(){
 function loadSubtitleCfg(){
   try { return JSON.parse(localStorage.getItem(SUBTITLE_CFG_KEY) || '{}') || {}; }
   catch(e){ return {}; }
+}
+function loadAudioCfg(){
+  try { return JSON.parse(localStorage.getItem(AUDIO_CFG_KEY) || '{}') || {}; }
+  catch(e){ return {}; }
+}
+function saveAudioCfg(){
+  try { localStorage.setItem(AUDIO_CFG_KEY, JSON.stringify({
+    voice:$('voice').value, rate:$('rate').value, defaults_version:2
+  })); } catch(e){}
 }
 function updateSubtitleUi(){
   const mode = $('subtitle_mode').value;
@@ -419,8 +430,18 @@ updateTitleControls();
 
 // 填充声音/语速
 fetch('/api/voices').then(r=>r.json()).then(d=>{
+  const saved=loadAudioCfg();
   d.voices.forEach(v=>{ const o=document.createElement('option'); o.value=v[0]; o.textContent=v[1]; $('voice').appendChild(o); });
-  d.rates.forEach(r=>{ const o=document.createElement('option'); o.value=r; o.textContent=r; if(r==='+6%')o.selected=true; $('rate').appendChild(o); });
+  d.rates.forEach(r=>{ const o=document.createElement('option'); o.value=r; o.textContent=r; $('rate').appendChild(o); });
+  const voiceValues=d.voices.map(v=>v[0]);
+  const savedVoice=(!saved.defaults_version && saved.voice==='zh-CN-YunxiNeural')?'zh-CN-YunyangNeural':saved.voice;
+  const savedRate=(!saved.defaults_version && saved.rate==='+6%')?'+0%':saved.rate;
+  $('voice').value=voiceValues.includes(savedVoice)?savedVoice:'zh-CN-YunyangNeural';
+  $('rate').value=d.rates.includes(savedRate)?savedRate:'+0%';
+  $('voice').addEventListener('change',saveAudioCfg);
+  $('rate').addEventListener('change',saveAudioCfg);
+}).catch(err=>{
+  $('applied-audio').textContent='配音选项加载失败: '+(err.message||err);
 });
 
 // 文件选择
@@ -626,6 +647,11 @@ $('btn-generate').onclick=()=>{
      (!$('llm_base_url').value.trim() || !$('llm_model').value.trim())){
     alert('中英双语字幕需要填写 LLM base_url 和 Model'); return;
   }
+  const selectedVoice=$('voice').value;
+  const selectedVoiceLabel=$('voice').selectedOptions[0]?.textContent||selectedVoice;
+  const selectedRate=$('rate').value;
+  if(!selectedVoice || !selectedRate){ alert('配音声音或语速尚未加载完成'); return; }
+  saveAudioCfg();
   const clip_durations=[...document.querySelectorAll('#nar-list .seg-dur')].map(t=>+t.value||+$('clip_duration').value);
   const payload={
     task_id:TASK_ID, clip_durations,
@@ -655,8 +681,9 @@ $('btn-generate').onclick=()=>{
     title:$('title').value, subtitle:$('subtitle').value,
     feature:$('feature').value, feature2:$('feature2').value,
     feature3:$('feature3').value, tagline:$('tagline').value,
-    voice:$('voice').value, rate:$('rate').value,
+    voice:selectedVoice, rate:selectedRate,
   };
+  $('applied-audio').textContent='本次提交：'+selectedVoiceLabel+'，语速 '+selectedRate;
   $('status2').textContent='提交中…';
   fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
     .then(async r=>{
@@ -672,6 +699,9 @@ function pollGen(){
     const pct=Math.round((st.progress||0)*100);
     $('bar2').style.width=pct+'%';
     $('status2').textContent=st.message||'';
+    if(st.voice_label && st.rate){
+      $('applied-audio').textContent='后端实际采用：'+st.voice_label+'，语速 '+st.rate;
+    }
     if(st.stage==='done'){
       $('card-out').style.display='block';
       const v=$('video-preview'); v.src='/api/download/'+TASK_ID+'?t='+Date.now(); v.style.display='block';

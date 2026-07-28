@@ -37,14 +37,15 @@ def _pipeline():
     return pipeline
 
 VOICES = [
-    ("zh-CN-YunxiNeural", "云希（男声）"),
     ("zh-CN-YunyangNeural", "云扬（男·新闻）"),
+    ("zh-CN-YunxiNeural", "云希（男声）"),
     ("zh-CN-XiaoxiaoNeural", "晓晓（女声）"),
     ("zh-CN-XiaoyiNeural", "晓伊（女声）"),
     ("zh-CN-liaoning-XiaobeiNeural", "辽宁晓蓓（女）"),
     ("zh-CN-shaanxi-XiaoniNeural", "陕西小妮（女）"),
 ]
-RATES = ["+12%", "+6%", "+0%", "-10%", "-20%"]
+RATES = ["+0%", "+6%", "+12%", "-10%", "-20%"]
+VOICE_LABELS = dict(VOICES)
 
 # 任务状态  task_id -> dict
 TASKS = {}
@@ -289,6 +290,8 @@ def api_status():
         if not st:
             return jsonify({"error": "not found"}), 404
         # \u590d\u5236\u53ef\u5e8f\u5217\u5316\u5b57\u6bb5\uff08\u53bb\u6389\u5927\u5bf9\u8c61\uff09
+        generation_params = st.get("generation_params") or {}
+        voice = generation_params.get("voice", "")
         return jsonify({
             "stage": st["stage"], "progress": st["progress"],
             "message": st["message"], "clips": st["clips"],
@@ -296,6 +299,9 @@ def api_status():
             "narration": st.get("narration", []),
             "output_ready": st["output_ready"],
             "srt_ready": st.get("srt_ready", False),
+            "voice": voice,
+            "voice_label": VOICE_LABELS.get(voice, ""),
+            "rate": generation_params.get("rate", ""),
         })
 
 
@@ -404,6 +410,12 @@ def api_generate():
     }
     if llm_cfg["provider"] not in ("openai", "nvidia"):
         llm_cfg["provider"] = "openai"
+    voice = str(data.get("voice") or "zh-CN-YunyangNeural").strip()
+    rate = str(data.get("rate") or "+0%").strip()
+    if voice not in VOICE_LABELS:
+        return jsonify({"error": f"不支持的配音声音: {voice}"}), 400
+    if rate not in RATES:
+        return jsonify({"error": f"不支持的语速: {rate}"}), 400
     params = {
         "pages_per_clip": int(data.get("pages_per_clip", 2)),
         "clip_duration": float(data.get("clip_duration", 12.0)),
@@ -431,14 +443,15 @@ def api_generate():
         "feature2": data.get("feature2", ""),
         "feature3": data.get("feature3", ""),
         "tagline": data.get("tagline", ""),
-        "voice": data.get("voice", "zh-CN-YunxiNeural"),
-        "rate": data.get("rate", "+6%"),
+        "voice": voice,
+        "rate": rate,
     }
     update_task(
         tid,
         stage="generating",
         progress=0.0,
-        message="开始生成视频（复用已提取文字，不会重新执行 OCR）",
+        message=(f"开始生成视频：{VOICE_LABELS[voice]}，语速 {rate}"
+                 "（复用已提取文字，不会重新执行 OCR）"),
         output_ready=False,
         srt_ready=False,
         generation_params=params,

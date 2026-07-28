@@ -45,7 +45,7 @@ r = c.post("/api/generate", json={
     "clip_duration": 2,
     "title_duration": 1,
     "title": "测试", "subtitle": "", "feature": "", "feature2": "", "feature3": "", "tagline": "",
-    "voice": "zh-CN-YunxiNeural", "rate": "+6%",
+    "voice": "zh-CN-YunyangNeural", "rate": "+0%",
 })
 print("generate submit:", r.get_json())
 

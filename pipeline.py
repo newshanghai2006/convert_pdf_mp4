@@ -1572,8 +1572,8 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
     pages_per_clip = max(1, int(params.get("pages_per_clip", 2)))
     clip_duration = float(params.get("clip_duration", 12.0))
     title_duration = float(params.get("title_duration", 3.0))
-    voice = params.get("voice", "zh-CN-YunxiNeural")
-    rate = params.get("rate", "+6%")
+    voice = params.get("voice", "zh-CN-YunyangNeural")
+    rate = params.get("rate", "+0%")
     font_path = params.get("font_path")
     # 新功能：根据解说词自动延长片段时长
     auto_duration = bool(params.get("auto_duration", False))
@@ -1753,8 +1753,8 @@ if __name__ == "__main__":
     ap.add_argument("--clip_duration", type=float, default=12.0)
     ap.add_argument("--title", default="大众电影")
     ap.add_argument("--subtitle", default="")
-    ap.add_argument("--voice", default="zh-CN-YunxiNeural")
-    ap.add_argument("--rate", default="+6%")
+    ap.add_argument("--voice", default="zh-CN-YunyangNeural")
+    ap.add_argument("--rate", default="+0%")
     ap.add_argument("--font", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "font.ttf"))
     args = ap.parse_args()
     pages = extract_page_texts(args.pdf, use_ocr=True,
