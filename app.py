@@ -87,6 +87,7 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
     try:
         llm_cfg = TASKS[tid].get("llm_cfg") or {}
         ai_ocr_cfg = ai_ocr_cfg or TASKS[tid].get("ai_ocr_cfg") or {}
+        compact_ocr_text = bool(TASKS[tid].get("compact_ocr_text"))
         # AI OCR has its own image path; keep the existing probe behavior for
         # AI narration that still relies on the local OCR result.
         probe_ocr = bool(llm_cfg.get("enabled") and
@@ -104,8 +105,13 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
             ocr_worker=OCR_WORKER, py_exe=__import__("sys").executable,
             ocr_lang=ocr_lang, probe_ocr=probe_ocr, ai_ocr_cfg=ai_ocr_cfg,
             ocr_engine=ocr_engine)
-        clips = p.group_into_clips(pages, pages_per_clip)
-        fallback_clips = list(clips)
+        fallback_clips = p.group_into_clips(pages, pages_per_clip)
+        if compact_ocr_text:
+            fallback_clips = [
+                re.sub(r"[\s\u200b\ufeff]+", "", text)
+                for text in fallback_clips
+            ]
+        clips = list(fallback_clips)
         update_task(tid, page_texts=pages,
                     fallback_narration=fallback_clips,
                     pages_per_clip=pages_per_clip)
@@ -229,6 +235,8 @@ def api_prepare():
     use_ocr = request.form.get("use_ocr", "true").lower() == "true"
     use_ai_narration = request.form.get("use_ai_narration", "false").lower() == "true"
     use_ai_ocr = request.form.get("use_ai_ocr", "false").lower() == "true"
+    compact_ocr_text = request.form.get(
+        "compact_ocr_text", "false").lower() == "true"
     if use_ai_narration or use_ai_ocr:
         use_ocr = True
     try:
@@ -272,6 +280,7 @@ def api_prepare():
             "llm_cfg": llm_cfg,
             "ai_ocr_cfg": ai_ocr_cfg,
             "ocr_engine": ocr_engine,
+            "compact_ocr_text": compact_ocr_text,
             "page_range": page_range,
         }
     t = threading.Thread(target=do_prepare,
