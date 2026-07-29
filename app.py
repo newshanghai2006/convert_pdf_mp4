@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AI PDF解说视频生成器（《大众电影》式杂志）本地 Web 应用。
-运行: py -3.14 app.py  然后浏览器打开 http://127.0.0.1:5005
+运行: py -3.14 app.py  然后浏览器打开 http://127.0.0.1:5006
 
 功能:
   - 上传 PDF
@@ -517,6 +517,6 @@ def _preflight():
 
 if __name__ == "__main__":
     _preflight()
-    print("启动服务: http://127.0.0.1:5005", flush=True)
-    print("（若浏览器打不开，确认本机防火墙未拦截 5005 端口）", flush=True)
-    app.run(host="127.0.0.1", port=5005, debug=False, threaded=True)
+    print("启动服务: http://127.0.0.1:5006", flush=True)
+    print("（若浏览器打不开，确认本机防火墙未拦截 5006 端口）", flush=True)
+    app.run(host="127.0.0.1", port=5006, debug=False, threaded=True)
