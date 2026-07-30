@@ -7,6 +7,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI PDF解说视频生成器</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="shortcut icon" href="/static/favicon.svg">
 <style>
   * { box-sizing: border-box; }
   body { margin:0; font-family: -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
