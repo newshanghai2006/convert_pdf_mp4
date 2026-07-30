@@ -61,6 +61,14 @@ def _bounded_float(data, key, default, low, high):
     return max(low, min(high, value))
 
 
+def _bounded_rpm(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(0.0, min(6000.0, value))
+
+
 def _title_font_sizes(data):
     return {
         "title": _bounded_float(data, "title_font_title", 100, 40, 180),
@@ -249,8 +257,11 @@ def api_prepare():
         "base_url": request.form.get("llm_base_url", "").strip(),
         "api_key": request.form.get("llm_api_key", "").strip(),
         "model": request.form.get("llm_model", "").strip(),
+        "llm_rpm": _bounded_rpm(request.form.get("llm_rpm", 0)),
         "narration_target_chars": narration_target_chars,
     }
+    if llm_common["provider"] not in ("openai", "nvidia", "sensenova"):
+        llm_common["provider"] = "openai"
     llm_cfg = dict(llm_common, enabled=use_ai_narration)
     ai_ocr_cfg = dict(llm_common, enabled=use_ai_ocr)
     page_range = request.form.get("page_range", "").strip()
@@ -363,9 +374,12 @@ def api_regenerate_narration():
                        stored_cfg.get("api_key") or "").strip(),
         "model": str(data.get("llm_model") or
                      stored_cfg.get("model") or "").strip(),
+        "llm_rpm": _bounded_rpm(
+            data.get("llm_rpm") if data.get("llm_rpm") is not None
+            else stored_cfg.get("llm_rpm", 0)),
         "narration_target_chars": max(40, min(400, target_chars)),
     }
-    if llm_cfg["provider"] not in ("openai", "nvidia"):
+    if llm_cfg["provider"] not in ("openai", "nvidia", "sensenova"):
         llm_cfg["provider"] = "openai"
     if not llm_cfg["base_url"] or not llm_cfg["model"]:
         return jsonify({"error": "请填写 LLM base_url 和 Model"}), 400
@@ -416,8 +430,11 @@ def api_generate():
                        stored_llm_cfg.get("api_key") or "").strip(),
         "model": str(data.get("llm_model") or
                      stored_llm_cfg.get("model") or "").strip(),
+        "llm_rpm": _bounded_rpm(
+            data.get("llm_rpm") if data.get("llm_rpm") is not None
+            else stored_llm_cfg.get("llm_rpm", 0)),
     }
-    if llm_cfg["provider"] not in ("openai", "nvidia"):
+    if llm_cfg["provider"] not in ("openai", "nvidia", "sensenova"):
         llm_cfg["provider"] = "openai"
     voice = str(data.get("voice") or "zh-CN-YunyangNeural").strip()
     rate = str(data.get("rate") or "+0%").strip()

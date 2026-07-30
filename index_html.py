@@ -124,6 +124,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <select id="llm_provider">
             <option value="openai" selected>通用 OpenAI 兼容接口</option>
             <option value="nvidia">NVIDIA 免费 API（限 40 rpm）</option>
+            <option value="sensenova">SenseNova（按模型自动限速）</option>
           </select>
         </div>
         <div class="grid3">
@@ -131,9 +132,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div><label>API Key</label><input type="password" id="llm_api_key" placeholder="sk-..."></div>
           <div><label>Model</label><input type="text" id="llm_model" placeholder="gpt-4o-mini"></div>
         </div>
-        <div style="margin-top:8px;max-width:220px;">
-          <label>每段AI旁白目标字数</label>
-          <input type="number" id="narration_target_chars" value="200" min="40" max="400" step="10">
+        <div class="grid2" style="margin-top:8px;">
+          <div><label>每段AI旁白目标字数</label>
+            <input type="number" id="narration_target_chars" value="200" min="40" max="400" step="10"></div>
+          <div><label>LLM RPM 上限</label>
+            <input type="number" id="llm_rpm" value="0" min="0" max="6000" step="1">
+            <div class="hint">0 = 按供应商和模型自动设置；通用接口为不限速</div></div>
         </div>
         <div class="hint" id="ai-provider-hint">开启后，系统会先根据每个片段的 OCR 文本生成旁白，再继续后面的配音流程。</div>
       </div>
@@ -294,6 +298,7 @@ function saveAiCfg(){
     llm_base_url: $('llm_base_url').value,
     llm_api_key: $('llm_api_key').value,
     llm_model: $('llm_model').value,
+    llm_rpm: $('llm_rpm').value,
     narration_target_chars: $('narration_target_chars').value,
     narration_target_chars_version: 2,
   };
@@ -378,12 +383,14 @@ function syncAiCfgUi(){
   if (aiPipelineOn) $('use_ocr').checked = true;
   $('use_ocr').disabled = aiPipelineOn;
   $('ocr_engine').disabled = aiOcrOn;
-  ['llm_provider','llm_base_url','llm_api_key','llm_model','narration_target_chars'].forEach(id=>{
+  ['llm_provider','llm_base_url','llm_api_key','llm_model','llm_rpm','narration_target_chars'].forEach(id=>{
     const el=$(id);
     if(el) el.disabled = !configOn;
   });
   if (provider === 'nvidia') {
-    $('ai-provider-hint').textContent = 'NVIDIA 模式会自动节流，请把 base_url / API Key / model 填好后再生成。';
+    $('ai-provider-hint').textContent = 'NVIDIA 留空或填 0 时按 36 RPM 节流；也可在 RPM 上限中自行覆盖。';
+  } else if (provider === 'sensenova') {
+    $('ai-provider-hint').textContent = 'SenseNova 留空或填 0 时：6.7 Flash Lite/U1 Fast 按 270 RPM，DeepSeek V4 Flash 按 90 RPM；可自行覆盖。';
   } else if (translateOn && !aiPipelineOn) {
     $('ai-provider-hint').textContent = '双语字幕会使用这里的 LLM 配置批量翻译英文，不会改变旁白内容。';
   } else if (aiOcrOn && on) {
@@ -403,13 +410,14 @@ if (savedAiCfg) {
   if (savedAiCfg.llm_base_url !== undefined) $('llm_base_url').value = savedAiCfg.llm_base_url;
   if (savedAiCfg.llm_api_key !== undefined) $('llm_api_key').value = savedAiCfg.llm_api_key;
   if (savedAiCfg.llm_model !== undefined) $('llm_model').value = savedAiCfg.llm_model;
+  if (savedAiCfg.llm_rpm !== undefined) $('llm_rpm').value = savedAiCfg.llm_rpm;
   if (savedAiCfg.narration_target_chars !== undefined &&
       !(Number(savedAiCfg.narration_target_chars) === 80 && !savedAiCfg.narration_target_chars_version)) {
     $('narration_target_chars').value = savedAiCfg.narration_target_chars;
   }
 }
 syncAiCfgUi();
-['use_ai_narration','use_ai_ocr','llm_provider','llm_base_url','llm_api_key','llm_model','narration_target_chars'].forEach(id=>{
+['use_ai_narration','use_ai_ocr','llm_provider','llm_base_url','llm_api_key','llm_model','llm_rpm','narration_target_chars'].forEach(id=>{
   const el=$(id);
   if(!el) return;
   el.addEventListener('change', ()=>{ syncAiCfgUi(); saveAiCfg(); });
@@ -554,6 +562,7 @@ $('btn-prepare').onclick=()=>{
   fd.append('llm_base_url', $('llm_base_url').value);
   fd.append('llm_api_key', $('llm_api_key').value);
   fd.append('llm_model', $('llm_model').value);
+  fd.append('llm_rpm', $('llm_rpm').value);
   fd.append('narration_target_chars', $('narration_target_chars').value);
   fd.append('page_range', $('page_range').value);
   fd.append('ocr_lang', $('ocr_lang').value);
@@ -606,6 +615,7 @@ $('btn-regenerate-ai').onclick=()=>{
     llm_base_url:$('llm_base_url').value,
     llm_api_key:$('llm_api_key').value,
     llm_model:$('llm_model').value,
+    llm_rpm:$('llm_rpm').value,
     narration_target_chars:$('narration_target_chars').value,
   };
   $('status1').textContent='正在提交AI旁白重写任务…';
@@ -679,6 +689,7 @@ $('btn-generate').onclick=()=>{
     llm_base_url:$('llm_base_url').value,
     llm_api_key:$('llm_api_key').value,
     llm_model:$('llm_model').value,
+    llm_rpm:$('llm_rpm').value,
     title_card_style:$('title_card_style').value,
     title_font_title:$('title_font_title').value,
     title_font_subtitle:$('title_font_subtitle').value,

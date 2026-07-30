@@ -20,6 +20,7 @@ import base64
 import time
 import math
 import asyncio
+import threading
 import subprocess
 from urllib import request as urlrequest
 from urllib import error as urlerror
@@ -805,6 +806,13 @@ def _openai_chat_completions_url(base_url):
     return base + "/chat/completions"
 
 
+class _LLMRequestError(RuntimeError):
+    def __init__(self, message, status_code=None, retry_after=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
 def _call_openai_chat(base_url, api_key, model, messages, temperature=0.4,
                       max_tokens=512, timeout=180):
     url = _openai_chat_completions_url(base_url)
@@ -830,9 +838,16 @@ def _call_openai_chat(base_url, api_key, model, messages, temperature=0.4,
             raw = resp.read().decode("utf-8", errors="replace")
     except urlerror.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-        raise RuntimeError(
+        retry_after = None
+        try:
+            retry_after = float(e.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            pass
+        raise _LLMRequestError(
             f"LLM 请求失败: HTTP {e.code} {e.reason}"
-            + (f" | {body[-500:]}" if body else "")
+            + (f" | {body[-500:]}" if body else ""),
+            status_code=e.code,
+            retry_after=retry_after,
         ) from e
     except Exception as e:
         raise RuntimeError(f"LLM 请求失败: {e}") from e
@@ -881,13 +896,11 @@ def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None):
     base_url = (llm_cfg or {}).get("base_url", "")
     api_key = (llm_cfg or {}).get("api_key", "")
     model = (llm_cfg or {}).get("model", "")
-    provider = (llm_cfg or {}).get("provider", "openai").strip().lower()
     if not base_url or not model:
         raise RuntimeError("AI OCR 配置不完整，请填写 base_url 和 model")
 
-    is_nvidia = provider == "nvidia"
-    min_interval = 1.65 if is_nvidia else 0.0
-    next_allowed_at = 0.0
+    rpm = _resolve_llm_rpm(llm_cfg)
+    provider_label = _llm_provider_label(llm_cfg)
     prompts = (
         "请准确识别这张 PDF 页面中的所有可见文字。按正常阅读顺序输出，"
         "尽量保留标题、段落和换行；不要补写图片中没有的内容，不要解释识别过程。"
@@ -900,18 +913,11 @@ def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None):
     try:
         total = doc.page_count
         for i in range(total):
-            if is_nvidia:
-                wait = max(0.0, next_allowed_at - time.time())
-                if wait > 0:
-                    if progress_cb:
-                        progress_cb("ai_ocr", i / max(1, total),
-                                    f"NVIDIA AI OCR 节流等待 {wait:.1f}s")
-                    time.sleep(wait)
-
             ok = False
             for attempt in range(1, 4):
-                if is_nvidia:
-                    next_allowed_at = max(next_allowed_at, time.time()) + min_interval
+                _wait_for_llm_slot(
+                    llm_cfg, rpm, progress_cb, "ai_ocr",
+                    i / max(1, total), f"{provider_label} AI OCR")
                 try:
                     raw = _call_openai_chat(
                         base_url, api_key, model,
@@ -927,11 +933,12 @@ def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None):
                     break
                 except Exception as e:
                     last_err = str(e)
-                    if is_nvidia and _is_retryable_llm_error(last_err) and attempt < 3:
-                        sleep_s = min(15.0, 1.7 * (2 ** (attempt - 1)))
+                    if _is_retryable_llm_error(last_err) and attempt < 3:
+                        sleep_s = _llm_retry_delay(e, attempt, rpm)
                         if progress_cb:
                             progress_cb("ai_ocr", i / max(1, total),
-                                        f"NVIDIA AI OCR 限流，重试 {attempt + 1}/3")
+                                        f"{provider_label} AI OCR 限流，等待 {sleep_s:.1f}s 后重试 {attempt + 1}/3")
+                        _defer_llm_requests(llm_cfg, sleep_s)
                         time.sleep(sleep_s)
                         continue
                     print(f"    AI OCR 第 {i + 1}/{total} 页失败，保留原结果: {e}")
@@ -973,20 +980,97 @@ def _clean_ai_text(text):
 def _is_retryable_llm_error(err_text):
     s = (err_text or "").lower()
     return any(k in s for k in (
-        "http 429", "too many requests", "rate limit",
+        "http 429", "too many requests", "rate limit", "rpm exhausted",
         "http 500", "http 502", "http 503", "http 504",
         "temporarily unavailable", "timeout",
     ))
+
+
+def _resolve_llm_rpm(llm_cfg):
+    """Return the configured or provider/model-specific safe RPM limit."""
+    try:
+        configured = float((llm_cfg or {}).get("llm_rpm", 0) or 0)
+    except (TypeError, ValueError):
+        configured = 0.0
+    if configured > 0:
+        return max(1.0, min(6000.0, configured))
+
+    provider = str((llm_cfg or {}).get("provider", "openai")).strip().lower()
+    model = str((llm_cfg or {}).get("model", "")).strip().lower()
+    if provider == "nvidia":
+        return 36.0
+    if provider == "sensenova":
+        if "deepseek-v4-flash" in model:
+            return 90.0
+        if "sensenova-6.7-flash-lite" in model or "sensenova-u1-fast" in model:
+            return 270.0
+    return 0.0
+
+
+def _llm_provider_label(llm_cfg):
+    provider = str((llm_cfg or {}).get("provider", "openai")).strip().lower()
+    return {"nvidia": "NVIDIA", "sensenova": "SenseNova"}.get(provider, "LLM")
+
+
+_LLM_RATE_LOCK = threading.Lock()
+_LLM_NEXT_ALLOWED = {}
+
+
+def _llm_rate_key(llm_cfg):
+    cfg = llm_cfg or {}
+    return (
+        str(cfg.get("base_url", "")).strip().lower(),
+        str(cfg.get("model", "")).strip().lower(),
+        hash(str(cfg.get("api_key", ""))),
+    )
+
+
+def _wait_for_llm_slot(llm_cfg, rpm, progress_cb=None,
+                       stage="ai", progress=0.0, operation="请求"):
+    """Reserve a process-wide fixed-rate slot for this API/model."""
+    if rpm <= 0:
+        return
+    now = time.time()
+    key = _llm_rate_key(llm_cfg)
+    with _LLM_RATE_LOCK:
+        allowed_at = max(now, _LLM_NEXT_ALLOWED.get(key, 0.0))
+        _LLM_NEXT_ALLOWED[key] = allowed_at + 60.0 / rpm
+    wait = max(0.0, allowed_at - now)
+    if wait > 0:
+        if progress_cb:
+            progress_cb(stage, progress, f"{operation}按 {rpm:g} RPM 节流等待 {wait:.1f}s")
+        time.sleep(wait)
+
+
+def _defer_llm_requests(llm_cfg, delay):
+    """Apply a shared cooldown after a provider rejects a request."""
+    if delay <= 0:
+        return
+    key = _llm_rate_key(llm_cfg)
+    with _LLM_RATE_LOCK:
+        _LLM_NEXT_ALLOWED[key] = max(
+            _LLM_NEXT_ALLOWED.get(key, 0.0), time.time() + delay)
+
+
+def _llm_retry_delay(error, attempt, rpm):
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is not None and retry_after >= 0:
+        return max(retry_after, 60.0 / rpm if rpm > 0 else 0.0)
+    text = str(error).lower()
+    if "rpm exhausted" in text:
+        return 60.0
+    if "http 429" in text or "too many requests" in text or "rate limit" in text:
+        return min(60.0, 15.0 * (2 ** (attempt - 1)))
+    return min(15.0, 1.7 * (2 ** (attempt - 1)))
 
 
 def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                           progress_cb=None):
     """
     Generate narration text for each clip via an OpenAI-compatible LLM.
-    NVIDIA mode is throttled to stay under the free-tier rpm limit.
+    Requests use the shared provider/model RPM limiter.
     """
     enabled = bool(llm_cfg and llm_cfg.get("enabled"))
-    provider = (llm_cfg or {}).get("provider", "openai").strip().lower()
     base_url = (llm_cfg or {}).get("base_url", "")
     api_key = (llm_cfg or {}).get("api_key", "")
     model = (llm_cfg or {}).get("model", "")
@@ -1002,9 +1086,8 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
     if not base_url or not model:
         return fallback_clips, "AI 旁白配置不完整，已保留原始文本"
 
-    is_nvidia = provider == "nvidia"
-    min_interval = 1.65 if is_nvidia else 0.0
-    next_allowed_at = 0.0
+    rpm = _resolve_llm_rpm(llm_cfg)
+    provider_label = _llm_provider_label(llm_cfg)
 
     clip_count = len(fallback_clips)
     out = []
@@ -1045,14 +1128,10 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
 
         ok = False
         for attempt in range(1, 4):
-            if is_nvidia:
-                wait = max(0.0, next_allowed_at - time.time())
-                if wait > 0:
-                    if progress_cb:
-                        progress_cb("ai", 0.55 + 0.35 * i / max(1, clip_count),
-                                    f"NVIDIA 模式节流等待 {wait:.1f}s")
-                    time.sleep(wait)
-                next_allowed_at = max(next_allowed_at, time.time()) + min_interval
+            _wait_for_llm_slot(
+                llm_cfg, rpm, progress_cb, "ai",
+                0.55 + 0.35 * i / max(1, clip_count),
+                f"{provider_label} AI 旁白")
             try:
                 raw = _call_openai_chat(
                     base_url, api_key, model,
@@ -1095,13 +1174,14 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                 break
             except Exception as e:
                 last_err = str(e)
-                retryable = is_nvidia and _is_retryable_llm_error(last_err)
+                retryable = _is_retryable_llm_error(last_err)
                 if retryable and attempt < 3:
-                    sleep_s = min(15.0, 1.7 * (2 ** (attempt - 1)))
+                    sleep_s = _llm_retry_delay(e, attempt, rpm)
                     print(f"    AI 旁白 {i + 1}/{clip_count} 命中限流，{sleep_s:.1f}s 后重试: {e}")
                     if progress_cb:
                         progress_cb("ai", 0.55 + 0.35 * i / max(1, clip_count),
-                                    f"NVIDIA 限流，重试 {attempt + 1}/3")
+                                    f"{provider_label} 限流，等待 {sleep_s:.1f}s 后重试 {attempt + 1}/3")
+                    _defer_llm_requests(llm_cfg, sleep_s)
                     time.sleep(sleep_s)
                     continue
                 failures += 1
@@ -1332,16 +1412,14 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
     """Translate Chinese subtitle cues in batches through the configured LLM."""
     if not cues:
         return []
-    provider = (llm_cfg or {}).get("provider", "openai").strip().lower()
     base_url = (llm_cfg or {}).get("base_url", "").strip()
     api_key = (llm_cfg or {}).get("api_key", "").strip()
     model = (llm_cfg or {}).get("model", "").strip()
     if not base_url or not model:
         raise RuntimeError("双语字幕需要填写 LLM base_url 和 model")
 
-    is_nvidia = provider == "nvidia"
-    min_interval = 1.65 if is_nvidia else 0.0
-    next_allowed_at = 0.0
+    rpm = _resolve_llm_rpm(llm_cfg)
+    provider_label = _llm_provider_label(llm_cfg)
     batch_size = 8
     completed = 0
     failed = 0
@@ -1351,18 +1429,14 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
         "with exactly one English translation for each input item, preserving order."
     )
     def translate_batch(batch, label):
-        nonlocal next_allowed_at, completed, failed
+        nonlocal completed, failed
         attempts = 3
         last_err = ""
+        last_exception = None
         for attempt in range(1, attempts + 1):
-            if is_nvidia:
-                wait = max(0.0, next_allowed_at - time.time())
-                if wait > 0:
-                    if progress_cb:
-                        progress_cb("translate", completed / max(1, len(cues)),
-                                    f"NVIDIA 翻译节流等待 {wait:.1f}s")
-                    time.sleep(wait)
-                next_allowed_at = max(next_allowed_at, time.time()) + min_interval
+            _wait_for_llm_slot(
+                llm_cfg, rpm, progress_cb, "translate",
+                completed / max(1, len(cues)), f"{provider_label} 字幕翻译")
             try:
                 raw = _call_openai_chat(
                     base_url, api_key, model,
@@ -1380,6 +1454,7 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
                 return result
             except (_TranslationCountError, _TranslationFormatError) as e:
                 last_err = str(e)
+                last_exception = e
                 if len(batch) > 1:
                     mid = len(batch) // 2
                     print(f"    AI 字幕翻译 {label} 返回不完整，拆分为 {mid}+{len(batch)-mid} 条重试")
@@ -1387,6 +1462,7 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
                             translate_batch(batch[mid:], label + "B"))
             except Exception as e:
                 last_err = str(e)
+                last_exception = e
                 # 认证、模型不存在等不可重试错误不再浪费整批时间。
                 if not _is_retryable_llm_error(last_err):
                     failed += len(batch)
@@ -1396,7 +1472,10 @@ def generate_ai_subtitle_translations(cues, llm_cfg, progress_cb=None):
 
             if attempt < attempts:
                 retryable = _is_retryable_llm_error(last_err)
-                sleep_s = min(12.0, (1.7 if retryable else 0.8) * (2 ** (attempt - 1)))
+                sleep_s = (_llm_retry_delay(last_exception, attempt, rpm) if retryable
+                           else min(12.0, 0.8 * (2 ** (attempt - 1))))
+                if retryable:
+                    _defer_llm_requests(llm_cfg, sleep_s)
                 time.sleep(sleep_s)
                 continue
             failed += len(batch)
