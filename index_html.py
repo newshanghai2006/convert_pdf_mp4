@@ -200,6 +200,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <label>封面版式</label>
         <select id="title_card_style">
           <option value="classic" selected>经典自动版式（当前）</option>
+          <option value="cinematic">金色电影海报版式</option>
           <option value="custom">自定义字号</option>
         </select>
         <div id="title-font-controls" class="grid2" style="display:none;margin-top:6px;">

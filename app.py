@@ -204,7 +204,7 @@ def api_title_preview():
         return jsonify({"error": "pdf not found"}), 404
 
     style = data.get("title_card_style", "classic")
-    if style not in ("classic", "custom"):
+    if style not in ("classic", "custom", "cinematic"):
         style = "classic"
     p = _pipeline()
     full_w, full_h = p.compute_dimensions(
@@ -461,7 +461,7 @@ def api_generate():
         "llm_cfg": llm_cfg,
         "title_card_style": (data.get("title_card_style", "classic")
                              if data.get("title_card_style", "classic") in
-                             ("classic", "custom") else "classic"),
+                             ("classic", "custom", "cinematic") else "classic"),
         "title_font_sizes": _title_font_sizes(data),
         "title": data.get("title", "大众电影"),
         "subtitle": data.get("subtitle", ""),

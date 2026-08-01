@@ -547,6 +547,223 @@ def extract_cover_page(pdf_path, video_dir):
         doc.close()
 
 
+def _create_cinematic_title_card(title_path, cover, font_path, title, subtitle,
+                                  feature, feature2, feature3, tagline,
+                                  width, height):
+    """Render a gold-and-crimson movie-magazine cover without external assets."""
+    Wd, Ht = width, height
+    base = min(Wd, Ht)
+    canvas = Image.new("RGB", (Wd, Ht), (19, 14, 10))
+    draw = ImageDraw.Draw(canvas)
+
+    # Warm black paper background with a restrained, deterministic texture.
+    for y in range(Ht):
+        glow = 1.0 - abs((y / max(1, Ht - 1)) - 0.42)
+        draw.line((0, y, Wd, y), fill=(
+            int(13 + 10 * glow), int(10 + 6 * glow), int(8 + 2 * glow)))
+    texture_step = max(5, int(base * 0.009))
+    for y in range(0, Ht, texture_step):
+        shade = 23 + ((y // texture_step) % 3) * 2
+        draw.line((0, y, Wd, y), fill=(shade, 17, 11))
+    glow_layer = Image.new("RGBA", (Wd, Ht), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow_layer)
+    glow_draw.ellipse((int(Wd * 0.32), -int(Ht * 0.45),
+                       int(Wd * 1.12), int(Ht * 0.72)),
+                      fill=(190, 115, 35, 52))
+    glow_layer = glow_layer.filter(
+        ImageFilter.GaussianBlur(max(18, int(base * 0.085))))
+    canvas.paste(glow_layer, (0, 0), glow_layer)
+    draw = ImageDraw.Draw(canvas)
+
+    gold = (226, 183, 89)
+    pale_gold = (250, 218, 143)
+    muted_gold = (180, 141, 69)
+    ivory = (244, 240, 229)
+    crimson = (139, 24, 27)
+    deep_crimson = (86, 14, 17)
+
+    def font(px):
+        try:
+            return ImageFont.truetype(font_path, max(10, int(px)))
+        except Exception:
+            return ImageFont.load_default()
+
+    def fit_font(text, size, max_width, min_size=10):
+        fnt = font(size)
+        if not text:
+            return fnt
+        box = draw.textbbox((0, 0), text, font=fnt,
+                            stroke_width=max(1, int(size * 0.025)))
+        current_width = max(1, box[2] - box[0])
+        if current_width <= max_width:
+            return fnt
+        return font(max(min_size, int(size * max_width / current_width * 0.97)))
+
+    def centered_text(cx, y, text, size, fill, max_width,
+                      stroke=0, stroke_fill=(21, 12, 7), shadow=False):
+        if not text:
+            return 0
+        fnt = fit_font(text, size, max_width, max(10, int(size * 0.42)))
+        box = draw.textbbox((0, 0), text, font=fnt,
+                            stroke_width=stroke)
+        tw, th = box[2] - box[0], box[3] - box[1]
+        x = int(cx - tw / 2 - box[0])
+        if shadow:
+            offset = max(3, int(base * 0.006))
+            draw.text((x + offset, y + offset), text, font=fnt,
+                      fill=(4, 3, 2), stroke_width=stroke + 1,
+                      stroke_fill=(4, 3, 2))
+        draw.text((x, y), text, font=fnt, fill=fill,
+                  stroke_width=stroke, stroke_fill=stroke_fill)
+        return th
+
+    def framed_cover(x, y, w, h):
+        cov = cover.resize((w, h), Image.LANCZOS)
+        shadow_pad = max(8, int(base * 0.016))
+        shadow = Image.new("RGBA", (w + shadow_pad * 2,
+                                     h + shadow_pad * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rectangle(
+            (shadow_pad, shadow_pad, w + shadow_pad, h + shadow_pad),
+            fill=(0, 0, 0, 190))
+        shadow = shadow.filter(
+            ImageFilter.GaussianBlur(max(8, int(base * 0.016))))
+        canvas.paste(shadow, (x - shadow_pad, y - shadow_pad), shadow)
+        outer = max(4, int(base * 0.007))
+        inner = max(2, int(base * 0.0025))
+        draw.rectangle((x - outer, y - outer, x + w + outer, y + h + outer),
+                       fill=(49, 30, 15), outline=gold,
+                       width=max(2, int(base * 0.003)))
+        draw.rectangle((x - inner, y - inner, x + w + inner, y + h + inner),
+                       fill=pale_gold)
+        canvas.paste(cov, (x, y))
+        corner = max(14, int(base * 0.035))
+        line_w = max(2, int(base * 0.003))
+        for sx, sy in ((x - outer, y - outer),
+                       (x + w + outer, y - outer),
+                       (x - outer, y + h + outer),
+                       (x + w + outer, y + h + outer)):
+            dx = corner if sx < x else -corner
+            dy = corner if sy < y else -corner
+            draw.line((sx, sy, sx + dx, sy), fill=pale_gold, width=line_w)
+            draw.line((sx, sy, sx, sy + dy), fill=pale_gold, width=line_w)
+
+    def rule(x0, x1, y, strong=False):
+        line_w = max(2, int(base * (0.004 if strong else 0.002)))
+        draw.line((x0, y, x1, y), fill=gold, width=line_w)
+        if strong:
+            gap = max(4, int(base * 0.008))
+            draw.line((x0, y + gap, x1, y + gap), fill=muted_gold,
+                      width=max(1, line_w // 2))
+
+    def banner(cx, y, text, max_width, size):
+        if not text:
+            return 0
+        fnt = fit_font(text, size, max_width * 0.8,
+                       max(12, int(size * 0.5)))
+        box = draw.textbbox((0, 0), text, font=fnt)
+        tw, th = box[2] - box[0], box[3] - box[1]
+        banner_w = min(max_width, max(int(max_width * 0.74),
+                                       tw + int(base * 0.07)))
+        banner_h = th + int(base * 0.035)
+        x0, x1 = int(cx - banner_w / 2), int(cx + banner_w / 2)
+        notch = max(7, int(base * 0.014))
+        draw.polygon(((x0 + notch, y), (x1, y),
+                      (x1 - notch, y + banner_h), (x0, y + banner_h)),
+                     fill=deep_crimson, outline=muted_gold)
+        inset = max(3, int(base * 0.005))
+        draw.polygon(((x0 + notch + inset, y + inset),
+                      (x1 - inset, y + inset),
+                      (x1 - notch - inset, y + banner_h - inset),
+                      (x0 + inset, y + banner_h - inset)), fill=crimson)
+        centered_text(cx, y + int(base * 0.012), text, size, pale_gold,
+                      banner_w * 0.82, stroke=max(1, int(base * 0.0015)),
+                      stroke_fill=(82, 12, 13))
+        return banner_h
+
+    title = title or "大众电影"
+    vertical = Ht >= Wd * 0.95
+    if not vertical:
+        margin_x = int(Wd * 0.045)
+        cover_w = int(Wd * 0.43)
+        cover_h = int(cover.height * cover_w / max(1, cover.width))
+        max_cover_h = int(Ht * 0.83)
+        if cover_h > max_cover_h:
+            cover_h = max_cover_h
+            cover_w = int(cover.width * cover_h / max(1, cover.height))
+        cover_y = (Ht - cover_h) // 2
+        framed_cover(margin_x, cover_y, cover_w, cover_h)
+
+        right_x = margin_x + cover_w + int(Wd * 0.055)
+        right_w = Wd - right_x - int(Wd * 0.045)
+        cx = right_x + right_w // 2
+        rule(right_x, right_x + right_w, int(Ht * 0.10), True)
+        y = int(Ht * 0.145)
+        y += centered_text(cx, y, title, base * 0.17, pale_gold,
+                           right_w * 0.98,
+                           stroke=max(2, int(base * 0.004)),
+                           shadow=True) + int(Ht * 0.035)
+        if subtitle:
+            y += centered_text(cx, y, subtitle, base * 0.047, ivory,
+                               right_w * 0.96,
+                               stroke=max(1, int(base * 0.0015)))
+            y += int(Ht * 0.035)
+        rule(right_x + int(right_w * 0.08),
+             right_x + int(right_w * 0.92), y)
+        y += int(Ht * 0.045)
+        y += banner(cx, y, feature, right_w * 0.98, base * 0.041)
+        if feature:
+            y += int(Ht * 0.035)
+        if feature2:
+            y += centered_text(cx, y, feature2, base * 0.038, gold,
+                               right_w * 0.94,
+                               stroke=max(1, int(base * 0.0015)))
+            y += int(Ht * 0.026)
+        if feature3:
+            centered_text(cx, y, feature3, base * 0.029, ivory,
+                          right_w * 0.94)
+        tag_x0, tag_x1, tag_cx = right_x, right_x + right_w, cx
+    else:
+        cx = Wd // 2
+        cover_top = int(Ht * 0.045)
+        cover_w = int(Wd * 0.72)
+        cover_h = int(cover.height * cover_w / max(1, cover.width))
+        max_cover_h = int(Ht * (0.40 if Ht > Wd * 1.25 else 0.38))
+        if cover_h > max_cover_h:
+            cover_h = max_cover_h
+            cover_w = int(cover.width * cover_h / max(1, cover.height))
+        framed_cover(cx - cover_w // 2, cover_top, cover_w, cover_h)
+        y = cover_top + cover_h + int(Ht * 0.035)
+        rule(int(Wd * 0.12), int(Wd * 0.88), y, True)
+        y += int(Ht * 0.025)
+        y += centered_text(cx, y, title, base * 0.135, pale_gold,
+                           Wd * 0.92,
+                           stroke=max(2, int(base * 0.004)),
+                           shadow=True) + int(Ht * 0.018)
+        if subtitle:
+            y += centered_text(cx, y, subtitle, base * 0.043, ivory,
+                               Wd * 0.88,
+                               stroke=max(1, int(base * 0.0015)))
+            y += int(Ht * 0.02)
+        y += banner(cx, y, feature, Wd * 0.86, base * 0.038)
+        if feature:
+            y += int(Ht * 0.018)
+        if feature2:
+            y += centered_text(cx, y, feature2, base * 0.034, gold,
+                               Wd * 0.88) + int(Ht * 0.012)
+        if feature3:
+            centered_text(cx, y, feature3, base * 0.027, ivory, Wd * 0.88)
+        tag_x0, tag_x1, tag_cx = int(Wd * 0.12), int(Wd * 0.88), cx
+
+    if tagline:
+        tag_y = int(Ht * 0.91)
+        rule(tag_x0, tag_x1, tag_y - int(Ht * 0.022))
+        centered_text(tag_cx, tag_y, tagline, base * 0.028,
+                      muted_gold, (tag_x1 - tag_x0) * 0.92)
+
+    canvas.save(title_path, quality=95)
+    return title_path
+
+
 def create_title_card(video_dir, font_path, title, subtitle, feature,
                       feature2, feature3, tagline, width=W, height=H,
                       title_style="classic", font_sizes=None):
@@ -557,6 +774,11 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
     title_path = os.path.join(video_dir, "title_card.png")
     cover_path = os.path.join(video_dir, "page_01.png")
     cover = Image.open(cover_path).convert("RGB")
+
+    if title_style == "cinematic":
+        return _create_cinematic_title_card(
+            title_path, cover, font_path, title, subtitle, feature,
+            feature2, feature3, tagline, width, height)
 
     Wd, Ht = width, height
     base = min(Wd, Ht)
