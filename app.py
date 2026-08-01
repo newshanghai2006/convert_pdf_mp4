@@ -336,9 +336,9 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
         if llm_cfg.get("enabled"):
             clips, ai_note = p.generate_ai_narration(
                 pages, pages_per_clip, clips, llm_cfg, cb)
-        ready_msg = "\u6587\u5b57\u63d0\u53d6\u5b8c\u6210\uff0c\u53ef\u7f16\u8f91\u65c1\u767d\u540e\u751f\u6210"
+        ready_msg = "文字提取完成，可编辑旁白后生成"
         if llm_cfg.get("enabled"):
-            ready_msg = f"\u6587\u5b57\u63d0\u53d6\u5b8c\u6210\uff0c{ai_note or 'AI \u65c1\u767d\u5df2\u751f\u6210'}\uff0c\u53ef\u7f16\u8f91\u540e\u751f\u6210\u89c6\u9891"
+            ready_msg = f"文字提取完成，{ai_note or 'AI 旁白已生成'}，可编辑后生成视频"
         update_task(tid, stage="ready", progress=1.0,
                     message=ready_msg,
                     narration=clips, clips=len(clips),
@@ -346,7 +346,7 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
     except TaskCancelled:
         update_task(tid, stage="cancelled", message="任务已取消")
     except Exception as e:
-        update_task(tid, stage="error", message=f"\u63d0\u53d6\u5931\u8d25: {e}")
+        update_task(tid, stage="error", message=f"提取失败: {e}")
     finally:
         _finalize_pending_delete(tid)
 
@@ -362,20 +362,20 @@ def do_regenerate_narration(tid, pages, pages_per_clip, fallback_clips, llm_cfg)
             raise TaskCancelled()
         clips, ai_note = _pipeline().generate_ai_narration(
             pages, pages_per_clip, fallback_clips, llm_cfg, cb)
-        message = ai_note or "AI \u65c1\u767d\u5df2\u91cd\u65b0\u751f\u6210"
+        message = ai_note or "AI 旁白已重新生成"
         update_task(tid, stage="ready", progress=1.0, message=message,
                     narration=clips, clips=len(clips), llm_cfg=llm_cfg)
     except TaskCancelled:
         update_task(tid, stage="cancelled", message="任务已取消")
     except Exception as e:
         update_task(tid, stage="ready", progress=1.0,
-                    message=f"AI \u65c1\u767d\u91cd\u65b0\u751f\u6210\u5931\u8d25\uff1a{e}\uff1b\u5df2\u4fdd\u7559\u5f53\u524d\u65c1\u767d")
+                    message=f"AI 旁白重新生成失败：{e}；已保留当前旁白")
     finally:
         _finalize_pending_delete(tid)
 
 
 # ---------------------------------------------------------------------------
-# \u540e\u53f0\uff1a\u751f\u6210\u89c6\u9891
+# 后台：生成视频
 # ---------------------------------------------------------------------------
 def do_generate(tid, pdf_path, params, narration):
     def cb(stage, pct, msg):
@@ -645,7 +645,7 @@ def api_prepare():
     with TASKS_LOCK:
         TASKS[tid] = {
             "stage": "preparing", "progress": 0.0,
-            "message": "\u6b63\u5728\u89e3\u6790\u9875\u7801\u9009\u62e9" if page_range else "\u5f00\u59cb\u63d0\u53d6\u6587\u5b57",
+            "message": "正在解析页码选择" if page_range else "开始提取文字",
             "pdf_path": pdf_path,
             "output_path": out_path, "output_ready": False,
             "narration": [], "clips": 0, "page_count": 0,
@@ -680,7 +680,7 @@ def api_status():
     if not st:
         return jsonify({"error": "not found"}), 404
     with TASKS_LOCK:
-        # \u590d\u5236\u53ef\u5e8f\u5217\u5316\u5b57\u6bb5\uff08\u53bb\u6389\u5927\u5bf9\u8c61\uff09
+        # 复制可序列化字段（去掉大对象）
         generation_params = st.get("generation_params") or {}
         voice = generation_params.get("voice", "")
         return jsonify({
