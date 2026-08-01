@@ -1,6 +1,6 @@
 # ===================== PDF 解说视频生成器 .gitignore =====================
 # 说明：这里列出「不需要上传到源码仓库」的文件/目录。
-# 需要上传的源码：app.py / pipeline.py / index_html.py / _ocr_worker.py /
+# 需要上传的源码：app.py / task_store.py / pipeline.py / index_html.py / _ocr_worker.py /
 #                _selftest.py / README_解说视频生成器.md / fonts.conf / stop.bat
 
 # ---- 运行时产物（每次任务生成，体积大且无需版本管理）----

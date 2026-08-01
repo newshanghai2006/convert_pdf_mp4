@@ -16,20 +16,84 @@ import re
 import json
 import time
 import uuid
+import hashlib
+import hmac
+import shutil
+import secrets
 import threading
 
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, g
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from index_html import INDEX_HTML
+from task_store import TaskStore
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_PATH = os.path.join(BASE_DIR, "font.ttf")
 OCR_WORKER = os.path.join(BASE_DIR, "_ocr_worker.py")
 UPLOAD_DIR = os.path.join(BASE_DIR, "tasks")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+TASK_DB_PATH = os.path.join(UPLOAD_DIR, "tasks.db")
+
+
+def _positive_int_env(name, default):
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_auth_secret():
+    configured = os.environ.get("MK_DZDY_AUTH_SECRET", "").encode("utf-8")
+    if len(configured) >= 32:
+        return hashlib.sha256(configured).digest()
+    secret_path = os.path.join(UPLOAD_DIR, ".auth_secret")
+    try:
+        with open(secret_path, "rb") as f:
+            existing = f.read()
+        if len(existing) >= 32:
+            return existing[:32]
+    except FileNotFoundError:
+        pass
+    generated = secrets.token_bytes(32)
+    try:
+        fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(generated)
+        return generated
+    except FileExistsError:
+        with open(secret_path, "rb") as f:
+            return f.read(32)
+
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+MAX_UPLOAD_MB = _positive_int_env("MK_DZDY_MAX_UPLOAD_MB", 512)
+MAX_ACTIVE_TASKS = _positive_int_env("MK_DZDY_MAX_ACTIVE_TASKS", 2)
+AUTH_COOKIE_DAYS = _positive_int_env("MK_DZDY_AUTH_COOKIE_DAYS", 30)
+AUTH_COOKIE_NAME = "mk_dzdy_owner"
+AUTH_SECRET = _load_auth_secret()
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+@app.after_request
+def _security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Vary"] = "Authorization, Cookie"
+    owner_hash = getattr(g, "issue_owner_cookie", None)
+    if owner_hash:
+        expires = int(time.time()) + AUTH_COOKIE_DAYS * 86400
+        payload = f"{owner_hash}.{expires}"
+        signature = hmac.new(
+            AUTH_SECRET, payload.encode("ascii"), hashlib.sha256).hexdigest()
+        response.set_cookie(
+            AUTH_COOKIE_NAME, f"{payload}.{signature}",
+            max_age=AUTH_COOKIE_DAYS * 86400, httponly=True,
+            secure=request.is_secure, samesite="Strict", path="/")
+    return response
 
 
 def _pipeline():
@@ -51,6 +115,143 @@ VOICE_LABELS = dict(VOICES)
 TASKS = {}
 TASKS_LOCK = threading.Lock()
 TITLE_PREVIEW_LOCK = threading.Lock()
+TASK_STORE = TaskStore(TASK_DB_PATH)
+TASK_STORE.mark_interrupted_tasks()
+CLIENT_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+TERMINAL_STAGES = {"ready", "done", "error", "cancelled"}
+
+
+class TaskCancelled(Exception):
+    pass
+
+
+def _request_owner_hash():
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        if CLIENT_TOKEN_RE.fullmatch(token):
+            owner_hash = hashlib.sha256(
+                token.lower().encode("ascii")).hexdigest()
+            g.issue_owner_cookie = owner_hash
+            return owner_hash
+    cookie = request.cookies.get(AUTH_COOKIE_NAME, "")
+    parts = cookie.split(".")
+    if len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+        return None
+    owner_hash, expires_text, supplied_signature = parts
+    try:
+        expires = int(expires_text)
+    except ValueError:
+        return None
+    if expires < int(time.time()):
+        return None
+    payload = f"{owner_hash}.{expires}"
+    expected_signature = hmac.new(
+        AUTH_SECRET, payload.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_signature, supplied_signature):
+        return None
+    return owner_hash
+
+
+def _require_owner():
+    owner_hash = _request_owner_hash()
+    if not owner_hash:
+        return None, (jsonify({"error": "需要有效的客户端恢复密钥"}), 401)
+    TASK_STORE.ensure_owner(owner_hash)
+    return owner_hash, None
+
+
+def _task_snapshot(st):
+    keys = (
+        "stage", "progress", "message", "pdf_path", "output_path",
+        "narration", "clips", "page_count", "srt_ready", "srt_path",
+        "output_ready", "page_texts", "fallback_narration",
+        "pages_per_clip", "ocr_engine", "compact_ocr_text", "page_range",
+        "file_name",
+    )
+    snap = {key: st.get(key) for key in keys if key in st}
+    generation_params = st.get("generation_params") or {}
+    if generation_params:
+        snap["generation_params"] = {
+            "voice": generation_params.get("voice", ""),
+            "rate": generation_params.get("rate", ""),
+        }
+    return snap
+
+
+def _persist_task(tid):
+    with TASKS_LOCK:
+        st = TASKS.get(tid)
+        if not st:
+            return
+        snapshot = _task_snapshot(st)
+    TASK_STORE.update_task(tid, snapshot)
+
+
+def _get_owned_task(tid, owner_hash):
+    if not tid:
+        return None
+    with TASKS_LOCK:
+        st = TASKS.get(tid)
+        if st and st.get("owner_hash") == owner_hash:
+            return st
+        if st:
+            return None
+    record = TASK_STORE.get_task(tid, owner_hash)
+    if not record:
+        return None
+    restored = dict(record["state"])
+    restored.update({
+        "owner_hash": owner_hash,
+        "cancel_requested": record["cancel_requested"],
+        "delete_pending": record["delete_pending"],
+    })
+    with TASKS_LOCK:
+        TASKS.setdefault(tid, restored)
+        return TASKS[tid]
+
+
+def _task_cancelled(tid):
+    with TASKS_LOCK:
+        st = TASKS.get(tid)
+        if st and st.get("cancel_requested"):
+            return True
+    record = TASK_STORE.get_task(tid)
+    return bool(record and record["cancel_requested"])
+
+
+def _safe_task_dir(tid):
+    root = os.path.realpath(UPLOAD_DIR)
+    path = os.path.realpath(os.path.join(root, tid))
+    if os.path.dirname(path) != root:
+        raise ValueError("invalid task path")
+    return path
+
+
+def _delete_task_files(tid):
+    path = _safe_task_dir(tid)
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _finalize_pending_delete(tid):
+    with TASKS_LOCK:
+        st = TASKS.get(tid)
+        delete_pending = bool(st and st.get("delete_pending"))
+        owner_hash = st.get("owner_hash") if st else None
+    if not delete_pending:
+        record = TASK_STORE.get_task(tid)
+        delete_pending = bool(record and record["delete_pending"])
+        owner_hash = owner_hash or (record["owner_hash"] if record else None)
+    if not delete_pending:
+        return
+    with TASKS_LOCK:
+        TASKS.pop(tid, None)
+    TASK_STORE.delete_task(tid, owner_hash)
+    try:
+        _delete_task_files(tid)
+    except OSError as exc:
+        print(f"任务 {tid} 文件清理失败: {exc}", flush=True)
 
 
 def _bounded_float(data, key, default, low, high):
@@ -81,7 +282,11 @@ def _title_font_sizes(data):
 
 def update_task(tid, **kw):
     with TASKS_LOCK:
-        TASKS[tid].update(kw)
+        st = TASKS.get(tid)
+        if not st:
+            return
+        st.update(kw)
+    _persist_task(tid)
 
 
 # ---------------------------------------------------------------------------
@@ -90,9 +295,13 @@ def update_task(tid, **kw):
 def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
                page_range="", ai_ocr_cfg=None, ocr_engine="easyocr"):
     def cb(stage, pct, msg):
+        if _task_cancelled(tid):
+            raise TaskCancelled()
         update_task(tid, stage=stage, progress=pct, message=msg)
 
     try:
+        if _task_cancelled(tid):
+            raise TaskCancelled()
         llm_cfg = TASKS[tid].get("llm_cfg") or {}
         ai_ocr_cfg = ai_ocr_cfg or TASKS[tid].get("ai_ocr_cfg") or {}
         compact_ocr_text = bool(TASKS[tid].get("compact_ocr_text"))
@@ -134,23 +343,35 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
                     message=ready_msg,
                     narration=clips, clips=len(clips),
                     page_count=len(pages))
+    except TaskCancelled:
+        update_task(tid, stage="cancelled", message="任务已取消")
     except Exception as e:
         update_task(tid, stage="error", message=f"\u63d0\u53d6\u5931\u8d25: {e}")
+    finally:
+        _finalize_pending_delete(tid)
 
 
 def do_regenerate_narration(tid, pages, pages_per_clip, fallback_clips, llm_cfg):
     def cb(stage, pct, msg):
+        if _task_cancelled(tid):
+            raise TaskCancelled()
         update_task(tid, stage=stage, progress=pct, message=msg)
 
     try:
+        if _task_cancelled(tid):
+            raise TaskCancelled()
         clips, ai_note = _pipeline().generate_ai_narration(
             pages, pages_per_clip, fallback_clips, llm_cfg, cb)
         message = ai_note or "AI \u65c1\u767d\u5df2\u91cd\u65b0\u751f\u6210"
         update_task(tid, stage="ready", progress=1.0, message=message,
                     narration=clips, clips=len(clips), llm_cfg=llm_cfg)
+    except TaskCancelled:
+        update_task(tid, stage="cancelled", message="任务已取消")
     except Exception as e:
         update_task(tid, stage="ready", progress=1.0,
                     message=f"AI \u65c1\u767d\u91cd\u65b0\u751f\u6210\u5931\u8d25\uff1a{e}\uff1b\u5df2\u4fdd\u7559\u5f53\u524d\u65c1\u767d")
+    finally:
+        _finalize_pending_delete(tid)
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +379,13 @@ def do_regenerate_narration(tid, pages, pages_per_clip, fallback_clips, llm_cfg)
 # ---------------------------------------------------------------------------
 def do_generate(tid, pdf_path, params, narration):
     def cb(stage, pct, msg):
+        if _task_cancelled(tid):
+            raise TaskCancelled()
         update_task(tid, stage=stage, progress=pct, message=msg)
 
     try:
+        if _task_cancelled(tid):
+            raise TaskCancelled()
         params["font_path"] = FONT_PATH
         out_path = TASKS[tid]["output_path"]
         res = _pipeline().build_video(pdf_path, out_path, params, narration, cb)
@@ -174,8 +399,12 @@ def do_generate(tid, pdf_path, params, narration):
                         srt_path=srt_path, srt_ready=srt_ready)
         else:
             update_task(tid, stage="error", message="视频合成失败，请查看服务端日志")
+    except TaskCancelled:
+        update_task(tid, stage="cancelled", message="任务已取消")
     except Exception as e:
         update_task(tid, stage="error", message=f"生成失败: {e}")
+    finally:
+        _finalize_pending_delete(tid)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +412,25 @@ def do_generate(tid, pdf_path, params, narration):
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return Response(INDEX_HTML, mimetype="text/html")
+    nonce = secrets.token_urlsafe(18)
+    html = INDEX_HTML.replace("<script>", f'<script nonce="{nonce}">', 1)
+    response = Response(html, mimetype="text/html")
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; media-src 'self' blob:; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+        "frame-ancestors 'none'; form-action 'self'")
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"error": f"上传文件超过服务器限制（{MAX_UPLOAD_MB} MB）"}), 413
 
 
 @app.route("/api/voices")
@@ -191,14 +438,119 @@ def api_voices():
     return jsonify({"voices": VOICES, "rates": RATES})
 
 
+def _clean_owner_settings(data):
+    provider = str(data.get("llm_provider") or "openai").strip().lower()
+    if provider not in ("openai", "nvidia", "sensenova"):
+        provider = "openai"
+    try:
+        target_chars = int(data.get("narration_target_chars", 200))
+    except (TypeError, ValueError):
+        target_chars = 200
+    return {
+        "llm_provider": provider,
+        "llm_base_url": str(data.get("llm_base_url") or "").strip()[:500],
+        "llm_model": str(data.get("llm_model") or "").strip()[:200],
+        "llm_rpm": _bounded_rpm(data.get("llm_rpm", 0)),
+        "narration_target_chars": max(40, min(400, target_chars)),
+        "use_ai_narration": bool(data.get("use_ai_narration", False)),
+        "use_ai_ocr": bool(data.get("use_ai_ocr", False)),
+    }
+
+
+@app.route("/api/client/settings", methods=["GET", "PUT"])
+def api_client_settings():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    if request.method == "GET":
+        return jsonify({"settings": TASK_STORE.get_owner_settings(owner_hash)})
+    data = request.get_json(force=True)
+    settings = _clean_owner_settings(data)
+    TASK_STORE.save_owner_settings(owner_hash, settings)
+    return jsonify({"ok": True, "settings": settings})
+
+
+@app.route("/api/tasks")
+def api_tasks():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    items = []
+    for record in TASK_STORE.list_tasks(owner_hash):
+        st = record["state"]
+        items.append({
+            "task_id": record["task_id"],
+            "stage": st.get("stage", "error"),
+            "progress": st.get("progress", 0.0),
+            "message": st.get("message", ""),
+            "file_name": st.get("file_name", "PDF 任务"),
+            "page_count": st.get("page_count", 0),
+            "output_ready": bool(st.get("output_ready")),
+            "srt_ready": bool(st.get("srt_ready")),
+            "cancel_requested": record["cancel_requested"],
+            "delete_pending": record["delete_pending"],
+            "phase": "generate" if st.get("generation_params") else "prepare",
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+        })
+    return jsonify({"tasks": items})
+
+
+@app.route("/api/tasks/<tid>/cancel", methods=["POST"])
+def api_cancel_task(tid):
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not found"}), 404
+    if st.get("stage") in TERMINAL_STAGES:
+        return jsonify({"error": "任务当前不在运行"}), 400
+    with TASKS_LOCK:
+        st["cancel_requested"] = True
+        st["message"] = "正在取消任务，请等待当前步骤结束"
+    _persist_task(tid)
+    TASK_STORE.set_flags(tid, owner_hash, cancel=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tasks/<tid>", methods=["DELETE"])
+def api_delete_task(tid):
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not found"}), 404
+    if st.get("stage") not in TERMINAL_STAGES:
+        with TASKS_LOCK:
+            st["cancel_requested"] = True
+            st["delete_pending"] = True
+            st["message"] = "正在取消并删除任务"
+        _persist_task(tid)
+        TASK_STORE.set_flags(tid, owner_hash, cancel=True, delete=True)
+        return jsonify({"ok": True, "pending": True}), 202
+    try:
+        _delete_task_files(tid)
+    except OSError as exc:
+        return jsonify({"error": f"任务文件删除失败: {exc}"}), 500
+    with TASKS_LOCK:
+        TASKS.pop(tid, None)
+    TASK_STORE.delete_task(tid, owner_hash)
+    return jsonify({"ok": True, "pending": False})
+
+
 @app.route("/api/title_preview", methods=["POST"])
 def api_title_preview():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
     data = request.get_json(force=True)
     tid = data.get("task_id")
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "task not found"}), 404
     with TASKS_LOCK:
-        st = TASKS.get(tid)
-        if not st:
-            return jsonify({"error": "task not found"}), 404
         pdf_path = st.get("pdf_path")
     if not pdf_path or not os.path.exists(pdf_path):
         return jsonify({"error": "pdf not found"}), 404
@@ -234,6 +586,16 @@ def api_title_preview():
 
 @app.route("/api/prepare", methods=["POST"])
 def api_prepare():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    active_count = sum(
+        1 for record in TASK_STORE.list_tasks(owner_hash, limit=1000)
+        if record["state"].get("stage") not in TERMINAL_STAGES)
+    if active_count >= MAX_ACTIVE_TASKS:
+        return jsonify({
+            "error": f"当前已有 {active_count} 个运行中任务，请等待或取消后再提交"
+        }), 429
     if "pdf" not in request.files:
         return jsonify({"error": "no pdf"}), 400
     f = request.files["pdf"]
@@ -272,7 +634,7 @@ def api_prepare():
     if ocr_engine not in ("easyocr", "rapidocr", "paddleocr"):
         ocr_engine = "easyocr"
 
-    tid = uuid.uuid4().hex[:12]
+    tid = uuid.uuid4().hex
     work = os.path.join(UPLOAD_DIR, tid)
     os.makedirs(work, exist_ok=True)
     fname = secure_filename(f.filename) or "input.pdf"
@@ -293,7 +655,13 @@ def api_prepare():
             "ocr_engine": ocr_engine,
             "compact_ocr_text": compact_ocr_text,
             "page_range": page_range,
+            "file_name": os.path.basename(f.filename)[:255] or fname,
+            "owner_hash": owner_hash,
+            "cancel_requested": False,
+            "delete_pending": False,
         }
+        initial_state = _task_snapshot(TASKS[tid])
+    TASK_STORE.create_task(tid, owner_hash, initial_state)
     t = threading.Thread(target=do_prepare,
                          args=(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang,
                                page_range, ai_ocr_cfg, ocr_engine))
@@ -304,11 +672,14 @@ def api_prepare():
 
 @app.route("/api/status")
 def api_status():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
     tid = request.args.get("task")
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not found"}), 404
     with TASKS_LOCK:
-        st = TASKS.get(tid)
-        if not st:
-            return jsonify({"error": "not found"}), 404
         # \u590d\u5236\u53ef\u5e8f\u5217\u5316\u5b57\u6bb5\uff08\u53bb\u6389\u5927\u5bf9\u8c61\uff09
         generation_params = st.get("generation_params") or {}
         voice = generation_params.get("voice", "")
@@ -322,35 +693,44 @@ def api_status():
             "voice": voice,
             "voice_label": VOICE_LABELS.get(voice, ""),
             "rate": generation_params.get("rate", ""),
+            "cancel_requested": bool(st.get("cancel_requested")),
+            "delete_pending": bool(st.get("delete_pending")),
         })
 
 
 @app.route("/api/save_narration", methods=["POST"])
 def api_save_narration():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
     data = request.get_json(force=True)
     tid = data.get("task_id")
     idx = int(data.get("idx", -1))
     text = data.get("text", "")
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not found"}), 404
     with TASKS_LOCK:
-        st = TASKS.get(tid)
-        if not st:
-            return jsonify({"error": "not found"}), 404
         narration = st.get("narration", [])
         if idx < 0 or idx >= len(narration):
             return jsonify({"error": "bad idx"}), 400
         narration[idx] = text
         st["narration"] = narration
+    _persist_task(tid)
     return jsonify({"ok": True})
 
 
 @app.route("/api/regenerate_narration", methods=["POST"])
 def api_regenerate_narration():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
     data = request.get_json(force=True)
     tid = data.get("task_id")
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not found"}), 404
     with TASKS_LOCK:
-        st = TASKS.get(tid)
-        if not st:
-            return jsonify({"error": "not found"}), 404
         if st["stage"] not in ("ready", "done"):
             return jsonify({"error": "task is busy"}), 400
         pages = list(st.get("page_texts") or [])
@@ -397,12 +777,15 @@ def api_regenerate_narration():
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
     data = request.get_json(force=True)
     tid = data.get("task_id")
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not found"}), 404
     with TASKS_LOCK:
-        st = TASKS.get(tid)
-        if not st:
-            return jsonify({"error": "not found"}), 404
         can_retry_generation = (
             st["stage"] == "ready"
             or (st["stage"] == "error" and st.get("generation_params"))
@@ -490,9 +873,14 @@ def api_generate():
 
 @app.route("/api/download/<tid>")
 def api_download(tid):
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not ready"}), 404
     with TASKS_LOCK:
-        st = TASKS.get(tid)
-        if not st or not st.get("output_ready"):
+        if not st.get("output_ready"):
             return jsonify({"error": "not ready"}), 404
         out_path = st["output_path"]
     return send_file(out_path, mimetype="video/mp4",
@@ -501,9 +889,14 @@ def api_download(tid):
 
 @app.route("/api/download_srt/<tid>")
 def api_download_srt(tid):
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not ready"}), 404
     with TASKS_LOCK:
-        st = TASKS.get(tid)
-        if not st or not st.get("srt_ready"):
+        if not st.get("srt_ready"):
             return jsonify({"error": "not ready"}), 404
         srt_path = st.get("srt_path", "")
     if not srt_path or not os.path.exists(srt_path):
