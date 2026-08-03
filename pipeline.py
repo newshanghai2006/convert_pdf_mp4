@@ -1871,13 +1871,13 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
     返回 out_path 或 None
     """
     pages_per_clip = max(1, int(params.get("pages_per_clip", 2)))
-    clip_duration = float(params.get("clip_duration", 12.0))
+    clip_duration = float(params.get("clip_duration", 8.0))
     title_duration = float(params.get("title_duration", 3.0))
     voice = params.get("voice", "zh-CN-YunyangNeural")
     rate = params.get("rate", "+0%")
     font_path = params.get("font_path")
     # 新功能：根据解说词自动延长片段时长
-    auto_duration = bool(params.get("auto_duration", False))
+    auto_duration = bool(params.get("auto_duration", True))
     max_clip_duration = float(params.get("max_clip_duration", 60.0))
     tail_pad = float(params.get("tail_pad", 1.0))
     # 新功能：输出宽高比 + 清晰度 -> 像素尺寸
@@ -2051,7 +2051,7 @@ if __name__ == "__main__":
     ap.add_argument("pdf")
     ap.add_argument("out")
     ap.add_argument("--pages_per_clip", type=int, default=2)
-    ap.add_argument("--clip_duration", type=float, default=12.0)
+    ap.add_argument("--clip_duration", type=float, default=8.0)
     ap.add_argument("--title", default="大众电影")
     ap.add_argument("--subtitle", default="")
     ap.add_argument("--voice", default="zh-CN-YunyangNeural")

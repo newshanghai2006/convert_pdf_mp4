@@ -495,7 +495,7 @@ def _clean_owner_settings(data):
         "llm_model": str(data.get("llm_model") or "").strip()[:200],
         "llm_rpm": _bounded_rpm(data.get("llm_rpm", 0)),
         "narration_target_chars": max(40, min(400, target_chars)),
-        "use_ai_narration": bool(data.get("use_ai_narration", False)),
+        "use_ai_narration": bool(data.get("use_ai_narration", True)),
         "use_ai_ocr": bool(data.get("use_ai_ocr", False)),
     }
 
@@ -646,10 +646,10 @@ def api_prepare():
         return jsonify({"error": "empty"}), 400
     pages_per_clip = int(request.form.get("pages_per_clip", 2))
     use_ocr = request.form.get("use_ocr", "true").lower() == "true"
-    use_ai_narration = request.form.get("use_ai_narration", "false").lower() == "true"
+    use_ai_narration = request.form.get("use_ai_narration", "true").lower() == "true"
     use_ai_ocr = request.form.get("use_ai_ocr", "false").lower() == "true"
     compact_ocr_text = request.form.get(
-        "compact_ocr_text", "false").lower() == "true"
+        "compact_ocr_text", "true").lower() == "true"
     if use_ai_narration or use_ai_ocr:
         use_ocr = True
     try:
@@ -873,10 +873,10 @@ def api_generate():
         return jsonify({"error": f"不支持的语速: {rate}"}), 400
     params = {
         "pages_per_clip": int(data.get("pages_per_clip", 2)),
-        "clip_duration": float(data.get("clip_duration", 12.0)),
+        "clip_duration": float(data.get("clip_duration", 8.0)),
         "clip_durations": clip_durs,
         "title_duration": float(data.get("title_duration", 3.0)),
-        "auto_duration": bool(data.get("auto_duration", False)),
+        "auto_duration": bool(data.get("auto_duration", True)),
         "max_clip_duration": float(data.get("max_clip_duration", 60.0)),
         "tail_pad": float(data.get("tail_pad", 1.0)),
         "aspect": data.get("aspect", "16:9"),

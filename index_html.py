@@ -119,8 +119,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     <div class="grid3" style="margin-top:14px;">
       <div><label>每片段时长(秒)</label>
-        <input type="number" id="clip_duration" value="12" min="2" max="120" step="0.5">
-        <div class="hint" id="clip_dur_hint">每个内容片段播放秒数</div></div>
+        <input type="number" id="clip_duration" value="8" min="2" max="120" step="0.5">
+        <div class="hint" id="clip_dur_hint">此值为<b>最短</b>时长，旁白读完自动延长</div></div>
       <div><label>每片段页数</label>
         <input type="number" id="pages_per_clip" value="2" min="1" max="8">
         <div class="hint">几页 PDF 拼成 1 个视频片段</div></div>
@@ -131,7 +131,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="grid3" style="margin-top:8px; align-items:end;">
       <div>
         <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;">
-          <input type="checkbox" id="auto_duration"> 按解说词自动延长片段时长</label>
+          <input type="checkbox" id="auto_duration" checked> 按解说词自动延长片段时长</label>
         <div class="hint">开启后「每片段时长」变为<b>最短</b>时长，旁白读完为止</div>
       </div>
       <div><label>片段最长时长(秒)</label>
@@ -148,7 +148,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     <div style="margin-top:10px; padding:10px 12px; border:1px solid #3a2c1e; border-radius:8px; background:#211910;">
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;margin:0;">
-        <input type="checkbox" id="use_ai_narration"> 使用AI自动生成旁白
+        <input type="checkbox" id="use_ai_narration" checked> 使用AI自动生成旁白
       </label>
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;margin:8px 0 0;">
         <input type="checkbox" id="use_ai_ocr"> 使用AI OCR识别纯图片文字
@@ -198,7 +198,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </select>
       </label>
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
-        <input type="checkbox" id="compact_ocr_text"> 去除提取文字中的换行和空格
+        <input type="checkbox" id="compact_ocr_text" checked> 去除提取文字中的换行和空格
       </label>
     </div>
     <div class="hint">繁体材料请选「繁体中文」（简繁模型不同，不能混识别；首次用繁体需联网下载繁体模型）。</div>
@@ -667,8 +667,8 @@ function syncAiCfgUi(){
 
 const savedAiCfg = loadAiCfg();
 if (savedAiCfg) {
-  $('use_ai_narration').checked = !!savedAiCfg.use_ai_narration;
-  $('use_ai_ocr').checked = !!savedAiCfg.use_ai_ocr;
+  if (savedAiCfg.use_ai_narration !== undefined) $('use_ai_narration').checked = !!savedAiCfg.use_ai_narration;
+  if (savedAiCfg.use_ai_ocr !== undefined) $('use_ai_ocr').checked = !!savedAiCfg.use_ai_ocr;
   if (savedAiCfg.llm_provider !== undefined) $('llm_provider').value = savedAiCfg.llm_provider;
   if (savedAiCfg.llm_base_url !== undefined) $('llm_base_url').value = savedAiCfg.llm_base_url;
   if (savedAiCfg.llm_api_key !== undefined) $('llm_api_key').value = savedAiCfg.llm_api_key;
