@@ -72,6 +72,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 MAX_UPLOAD_MB = _positive_int_env("MK_DZDY_MAX_UPLOAD_MB", 512)
 MAX_ACTIVE_TASKS = _positive_int_env("MK_DZDY_MAX_ACTIVE_TASKS", 2)
 AUTH_COOKIE_DAYS = _positive_int_env("MK_DZDY_AUTH_COOKIE_DAYS", 30)
+ASSET_TICKET_HOURS = _positive_int_env("MK_DZDY_ASSET_TICKET_HOURS", 24)
 AUTH_COOKIE_NAME = "mk_dzdy_owner"
 AUTH_SECRET = _load_auth_secret()
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -159,6 +160,48 @@ def _require_owner():
         return None, (jsonify({"error": "需要有效的客户端恢复密钥"}), 401)
     TASK_STORE.ensure_owner(owner_hash)
     return owner_hash, None
+
+
+def _create_asset_ticket(tid, owner_hash):
+    expires = int(time.time()) + ASSET_TICKET_HOURS * 3600
+    payload = f"asset:{tid}:{owner_hash}:{expires}"
+    signature = hmac.new(
+        AUTH_SECRET, payload.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{expires}.{signature}"
+
+
+def _owner_from_asset_ticket(tid, ticket):
+    parts = str(ticket or "").split(".")
+    if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+        return None
+    try:
+        expires = int(parts[0])
+    except ValueError:
+        return None
+    if expires < int(time.time()):
+        return None
+    record = TASK_STORE.get_task(tid)
+    if not record:
+        return None
+    owner_hash = record["owner_hash"]
+    payload = f"asset:{tid}:{owner_hash}:{expires}"
+    expected = hmac.new(
+        AUTH_SECRET, payload.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, parts[1]):
+        return None
+    return owner_hash
+
+
+def _get_download_task(tid):
+    owner_hash = _request_owner_hash()
+    if owner_hash:
+        st = _get_owned_task(tid, owner_hash)
+        if st:
+            return st
+    ticket_owner = _owner_from_asset_ticket(tid, request.args.get("ticket"))
+    if not ticket_owner:
+        return None
+    return _get_owned_task(tid, ticket_owner)
 
 
 def _task_snapshot(st):
@@ -683,6 +726,8 @@ def api_status():
         # 复制可序列化字段（去掉大对象）
         generation_params = st.get("generation_params") or {}
         voice = generation_params.get("voice", "")
+        asset_ticket = (_create_asset_ticket(tid, owner_hash)
+                        if st.get("output_ready") else "")
         return jsonify({
             "stage": st["stage"], "progress": st["progress"],
             "message": st["message"], "clips": st["clips"],
@@ -695,6 +740,7 @@ def api_status():
             "rate": generation_params.get("rate", ""),
             "cancel_requested": bool(st.get("cancel_requested")),
             "delete_pending": bool(st.get("delete_pending")),
+            "asset_ticket": asset_ticket,
         })
 
 
@@ -873,28 +919,25 @@ def api_generate():
 
 @app.route("/api/download/<tid>")
 def api_download(tid):
-    owner_hash, error = _require_owner()
-    if error:
-        return error
-    st = _get_owned_task(tid, owner_hash)
+    st = _get_download_task(tid)
     if not st:
-        return jsonify({"error": "not ready"}), 404
+        return jsonify({"error": "需要有效的客户端身份或下载票据"}), 401
     with TASKS_LOCK:
         if not st.get("output_ready"):
             return jsonify({"error": "not ready"}), 404
         out_path = st["output_path"]
+    as_attachment = request.args.get("download") == "1"
     return send_file(out_path, mimetype="video/mp4",
-                     as_attachment=True, download_name="解说视频.mp4")
+                     as_attachment=as_attachment,
+                     download_name="AI_PDF_video.mp4",
+                     conditional=True)
 
 
 @app.route("/api/download_srt/<tid>")
 def api_download_srt(tid):
-    owner_hash, error = _require_owner()
-    if error:
-        return error
-    st = _get_owned_task(tid, owner_hash)
+    st = _get_download_task(tid)
     if not st:
-        return jsonify({"error": "not ready"}), 404
+        return jsonify({"error": "需要有效的客户端身份或下载票据"}), 401
     with TASKS_LOCK:
         if not st.get("srt_ready"):
             return jsonify({"error": "not ready"}), 404
@@ -902,7 +945,9 @@ def api_download_srt(tid):
     if not srt_path or not os.path.exists(srt_path):
         return jsonify({"error": "not found"}), 404
     return send_file(srt_path, mimetype="application/x-subrip",
-                     as_attachment=True, download_name="解说字幕.srt")
+                     as_attachment=True,
+                     download_name="AI_PDF_subtitles.srt",
+                     conditional=True)
 
 
 def _preflight():

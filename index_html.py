@@ -1016,16 +1016,24 @@ function showCompletedTask(st){
   $('bar2').style.width='100%';
   $('card-out').style.display='block';
   const downloadBase='/api/download/'+encodeURIComponent(TASK_ID);
-  const v=$('video-preview'); v.src=downloadBase+'?t='+Date.now(); v.style.display='block';
+  const previewParams=new URLSearchParams({t:String(Date.now())});
+  if(st.asset_ticket) previewParams.set('ticket',st.asset_ticket);
+  const v=$('video-preview'); v.src=downloadBase+'?'+previewParams.toString(); v.style.display='block';
   const links=$('out-links'); links.innerHTML='';
+  const downloadParams=new URLSearchParams({download:'1'});
+  if(st.asset_ticket) downloadParams.set('ticket',st.asset_ticket);
   const videoLink=document.createElement('a');
-  videoLink.className='dl'; videoLink.href=downloadBase;
+  videoLink.className='dl'; videoLink.href=downloadBase+'?'+downloadParams.toString();
+  videoLink.download='AI_PDF_video.mp4';
   videoLink.textContent='下载 MP4'; links.appendChild(videoLink);
   if(st.srt_ready){
     const sep=document.createTextNode('　');
     const srtLink=document.createElement('a');
     srtLink.className='dl';
-    srtLink.href='/api/download_srt/'+encodeURIComponent(TASK_ID);
+    const srtParams=new URLSearchParams();
+    if(st.asset_ticket) srtParams.set('ticket',st.asset_ticket);
+    srtLink.href='/api/download_srt/'+encodeURIComponent(TASK_ID)+'?'+srtParams.toString();
+    srtLink.download='AI_PDF_subtitles.srt';
     srtLink.textContent='下载 SRT 字幕'; links.append(sep,srtLink);
   }
   $('status2').innerHTML='<span class="ok">完成！可预览/下载。</span>';
