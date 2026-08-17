@@ -1036,6 +1036,15 @@ function showCompletedTask(st){
     srtLink.download='AI_PDF_subtitles.srt';
     srtLink.textContent='下载 SRT 字幕'; links.append(sep,srtLink);
   }
+  const coverSep=document.createTextNode('　');
+  const coverLink=document.createElement('a');
+  coverLink.className='dl';
+  const coverParams=new URLSearchParams({download:'1'});
+  if(st.asset_ticket) coverParams.set('ticket',st.asset_ticket);
+  coverLink.href='/api/download_cover/'+encodeURIComponent(TASK_ID)+'?'+coverParams.toString();
+  coverLink.download='AI_PDF_cover.png';
+  coverLink.textContent='下载封面图片';
+  links.append(coverSep,coverLink);
   $('status2').innerHTML='<span class="ok">完成！可预览/下载。</span>';
 }
 function showGenerationError(st){

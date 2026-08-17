@@ -950,6 +950,28 @@ def api_download_srt(tid):
                      conditional=True)
 
 
+@app.route("/api/download_cover/<tid>")
+def api_download_cover(tid):
+    """下载与最终视频使用同一版式生成的封面图片。"""
+    st = _get_download_task(tid)
+    if not st:
+        return jsonify({"error": "需要有效的客户端身份或下载票据"}), 401
+    with TASKS_LOCK:
+        if not st.get("output_ready"):
+            return jsonify({"error": "not ready"}), 404
+        out_path = st.get("output_path", "")
+    if not out_path:
+        return jsonify({"error": "封面不存在"}), 404
+    workdir = os.path.splitext(out_path)[0] + "_work"
+    cover_path = os.path.join(workdir, "video", "title_card.png")
+    if not os.path.isfile(cover_path):
+        return jsonify({"error": "封面不存在"}), 404
+    return send_file(cover_path, mimetype="image/png",
+                     as_attachment=True,
+                     download_name="AI_PDF_cover.png",
+                     conditional=True)
+
+
 def _preflight():
     """启动前自检：打印关键依赖状态，避免“运行无显示”一头雾水。"""
     import shutil
