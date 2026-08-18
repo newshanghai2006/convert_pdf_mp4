@@ -116,6 +116,7 @@ VOICE_LABELS = dict(VOICES)
 TASKS = {}
 TASKS_LOCK = threading.Lock()
 TITLE_PREVIEW_LOCK = threading.Lock()
+CLIP_PREVIEW_LOCK = threading.Lock()
 TASK_STORE = TaskStore(TASK_DB_PATH)
 TASK_STORE.mark_interrupted_tasks()
 CLIENT_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -208,7 +209,7 @@ def _task_snapshot(st):
     keys = (
         "stage", "progress", "message", "pdf_path", "output_path",
         "narration", "clips", "page_count", "srt_ready", "srt_path",
-        "output_ready", "page_texts", "fallback_narration",
+        "pdf_page_count", "output_ready", "page_texts", "fallback_narration",
         "pages_per_clip", "ocr_engine", "compact_ocr_text", "page_range",
         "file_name",
     )
@@ -353,6 +354,7 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
         probe_ocr = bool(llm_cfg.get("enabled") and
                          not ai_ocr_cfg.get("enabled"))
         p = _pipeline()
+        update_task(tid, pdf_page_count=p.get_pdf_page_count(pdf_path))
         if page_range:
             cb("extract", 0.01, "正在解析页码选择")
             sel_path = os.path.join(os.path.dirname(pdf_path), "input_sel.pdf")
@@ -627,6 +629,39 @@ def api_title_preview():
                     headers={"Cache-Control": "no-store"})
 
 
+@app.route("/api/clip_preview/<tid>/<int:clip_index>")
+def api_clip_preview(tid, clip_index):
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "task not found"}), 404
+    if clip_index < 0:
+        return jsonify({"error": "invalid clip index"}), 400
+    with TASKS_LOCK:
+        pdf_path = st.get("pdf_path")
+        pages_per_clip = int(st.get("pages_per_clip") or 1)
+        page_count = int(st.get("page_count") or 0)
+    if not pdf_path or not os.path.exists(pdf_path):
+        return jsonify({"error": "pdf not found"}), 404
+    if page_count and clip_index * pages_per_clip >= page_count:
+        return jsonify({"error": "clip not found"}), 404
+
+    preview_dir = os.path.join(os.path.dirname(pdf_path), "clip_preview")
+    preview_path = os.path.join(preview_dir, f"clip_{clip_index + 1:04d}.jpg")
+    p = _pipeline()
+    with CLIP_PREVIEW_LOCK:
+        if not os.path.exists(preview_path):
+            try:
+                p.create_clip_preview(pdf_path, clip_index, pages_per_clip,
+                                      preview_path)
+            except IndexError:
+                return jsonify({"error": "clip not found"}), 404
+    return send_file(preview_path, mimetype="image/jpeg",
+                     conditional=True, max_age=3600)
+
+
 @app.route("/api/prepare", methods=["POST"])
 def api_prepare():
     owner_hash, error = _require_owner()
@@ -692,6 +727,7 @@ def api_prepare():
             "pdf_path": pdf_path,
             "output_path": out_path, "output_ready": False,
             "narration": [], "clips": 0, "page_count": 0,
+            "pdf_page_count": 0,
             "srt_ready": False, "srt_path": "",
             "llm_cfg": llm_cfg,
             "ai_ocr_cfg": ai_ocr_cfg,
@@ -732,6 +768,7 @@ def api_status():
             "stage": st["stage"], "progress": st["progress"],
             "message": st["message"], "clips": st["clips"],
             "page_count": st["page_count"],
+            "pdf_page_count": st.get("pdf_page_count", 0),
             "narration": st.get("narration", []),
             "output_ready": st["output_ready"],
             "srt_ready": st.get("srt_ready", False),

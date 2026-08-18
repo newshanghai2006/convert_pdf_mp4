@@ -275,6 +275,15 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
     return parse_ocr_txt(out_txt, N)
 
 
+def get_pdf_page_count(pdf_path):
+    """Return the page count without extracting text or rendering pages."""
+    doc = fitz.open(pdf_path)
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
 def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
                        ocr_lang="ch_sim", ocr_engine="easyocr"):
     """
@@ -517,6 +526,43 @@ def create_combined_frames(total_pages, pages_per_clip, video_dir,
         if progress_cb:
             progress_cb("frames", (i + 1) / total_pages, f"合成帧 {len(frame_paths)}")
     return frame_paths
+
+
+def create_clip_preview(pdf_path, clip_index, pages_per_clip, out_path,
+                        width=420):
+    """Render one content clip's pages into a small side-by-side JPG preview."""
+    if clip_index < 0 or pages_per_clip < 1:
+        raise ValueError("invalid clip preview range")
+    doc = fitz.open(pdf_path)
+    try:
+        start = clip_index * pages_per_clip
+        if start >= doc.page_count:
+            raise IndexError("clip preview page out of range")
+        end = min(start + pages_per_clip, doc.page_count)
+        images = []
+        for page_index in range(start, end):
+            pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(1, 1),
+                                             alpha=False)
+            images.append(Image.frombytes("RGB", [pix.width, pix.height],
+                                          pix.samples))
+    finally:
+        doc.close()
+
+    total_width = sum(image.width for image in images)
+    max_height = max(image.height for image in images)
+    canvas = Image.new("RGB", (total_width, max_height), (255, 255, 255))
+    x = 0
+    for image in images:
+        canvas.paste(image, (x, 0))
+        x += image.width
+    scale = min(1.0, float(width) / max(1, canvas.width))
+    if scale < 1.0:
+        canvas = canvas.resize(
+            (max(1, int(canvas.width * scale)),
+             max(1, int(canvas.height * scale))), Image.LANCZOS)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.save(out_path, format="JPEG", quality=84, optimize=True)
+    return out_path
 
 
 def trim_white_border(img, pad=6):

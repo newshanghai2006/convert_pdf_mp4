@@ -51,6 +51,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .seg-nar { border:1px solid #3a2c1e; border-radius:8px; padding:8px 10px; margin-bottom:8px;
              background:#211910; }
   .seg-nar b { color:#e0a44a; font-size:12px; }
+  .seg-content { display:grid; grid-template-columns:minmax(150px,220px) minmax(0,1fr);
+                 gap:10px; align-items:start; margin-top:6px; }
+  .seg-thumb-wrap { min-height:110px; display:flex; align-items:center; justify-content:center;
+                    background:#140f0b; border:1px solid #4a3a2a; border-radius:6px;
+                    overflow:hidden; color:#8c7c63; font-size:11px; text-align:center; }
+  .seg-thumb { display:block; width:100%; height:150px; object-fit:contain; }
+  .seg-thumb-empty { padding:10px; }
   #video-preview { width:100%; border-radius:10px; margin-top:10px; background:#000; display:none; }
   .pill { display:inline-block; background:#3a2c1e; color:#e8c89a; border-radius:20px;
           padding:3px 12px; font-size:12px; margin-left:8px; }
@@ -80,6 +87,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   @media (max-width:700px) {
     .title-preview-layout { grid-template-columns:1fr; }
     .grid2,.grid3 { grid-template-columns:1fr; }
+    .seg-content { grid-template-columns:1fr; }
     .identity-row,.task-row { grid-template-columns:1fr; }
     .task-actions { justify-content:flex-start; }
     .identity-actions button { flex:1 1 calc(50% - 4px); }
@@ -141,7 +149,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div style="margin-top:10px;">
-      <label>选择参与制作的页码（可选）</label>
+      <label>选择参与制作的页码（可选）
+        <span id="pdf-page-count" class="hint" style="display:inline;margin-left:8px;">PDF总页数：待载入</span>
+      </label>
       <input type="text" id="page_range" placeholder="如 1~10,15~20,30；留空 = 全部页">
       <div class="hint">只用这些页参与制作；支持 <b>~</b> 或 <b>-</b> 表示范围、逗号分隔，按填写顺序排列</div>
     </div>
@@ -729,7 +739,11 @@ drop.onclick=()=>fileInput.click();
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('hover');}));
 drop.addEventListener('drop',ev=>{ if(ev.dataTransfer.files[0]) setFile(ev.dataTransfer.files[0]); });
 fileInput.onchange=()=>{ if(fileInput.files[0]) setFile(fileInput.files[0]); };
-function setFile(f){ $('file-name').textContent='已选: '+f.name; window._file=f; }
+function setFile(f){
+  $('file-name').textContent='已选: '+f.name;
+  $('pdf-page-count').textContent='PDF总页数：上传后读取';
+  window._file=f;
+}
 
 // 自动时长开关：切换「每片段时长」的提示文案
 $('auto_duration').addEventListener('change', e=>{
@@ -846,7 +860,7 @@ $('btn-prepare').onclick=()=>{
 };
 
 function showReadyTask(st){
-  renderNarration(st.narration || []);
+  renderNarration(st.narration || [], st);
   $('card-nar').style.display='block';
   $('card-opt').style.display='block';
   $('status1').textContent='';
@@ -858,7 +872,7 @@ function showReadyTask(st){
   scheduleTitlePreview(0);
 }
 function showTaskWorkspace(st){
-  if(st.narration && st.narration.length) renderNarration(st.narration);
+  if(st.narration && st.narration.length) renderNarration(st.narration, st);
   $('card-nar').style.display='block';
   $('card-opt').style.display='block';
 }
@@ -880,6 +894,9 @@ function pollPrepare(){
     const pct=Math.round((st.progress||0)*100);
     $('bar1').style.width=pct+'%';
     $('status1').textContent=st.message||'';
+    if(Number(st.pdf_page_count||0)>0){
+      $('pdf-page-count').textContent='PDF总页数：'+st.pdf_page_count+' 页';
+    }
     if(st.stage==='ready'){
       rememberActiveTask('prepare');
       showReadyTask(st);
@@ -927,7 +944,7 @@ $('btn-regenerate-ai').onclick=()=>{
   }).catch(err=>{ $('status1').textContent=err.message; });
 };
 
-function renderNarration(arr){
+function renderNarration(arr, st={}){
   $('clip-pill').textContent=arr.length+' 段';
   const list=$('nar-list'); list.innerHTML='';
   const gdur=$('clip_duration').value;
@@ -944,10 +961,21 @@ function renderNarration(arr){
     di.style.cssText='width:74px;padding:5px 7px;';
     durWrap.appendChild(di); head.appendChild(durWrap);
     d.appendChild(head);
+    const body=document.createElement('div'); body.className='seg-content';
+    const thumbWrap=document.createElement('div'); thumbWrap.className='seg-thumb-wrap';
+    const thumb=document.createElement('img'); thumb.className='seg-thumb';
+    thumb.alt='片段 '+(i+1)+' 图片预览'; thumb.loading='lazy';
+    thumb.src='/api/clip_preview/'+encodeURIComponent(TASK_ID)+'/'+i+'?v='+Date.now();
+    thumb.onerror=()=>{
+      thumbWrap.textContent='图片预览不可用';
+      thumbWrap.classList.add('seg-thumb-empty');
+    };
+    thumbWrap.appendChild(thumb);
     const ta=document.createElement('textarea'); ta.rows=5; ta.value=t; ta.dataset.idx=i;
-    ta.style.marginTop='6px';
+    ta.style.marginTop='0';
     ta.addEventListener('input', ()=>debounceSaveNarration(i, ta.value));
-    d.appendChild(ta); list.appendChild(d);
+    body.append(thumbWrap,ta);
+    d.appendChild(body); list.appendChild(d);
   });
 }
 
