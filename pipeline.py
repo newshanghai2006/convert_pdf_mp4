@@ -1333,7 +1333,8 @@ def _llm_retry_delay(error, attempt, rpm):
 
 
 def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
-                          progress_cb=None):
+                          progress_cb=None, failure_indices=None,
+                          failure_reasons=None):
     """
     Generate narration text for each clip via an OpenAI-compatible LLM.
     Requests use the shared provider/model RPM limiter.
@@ -1362,12 +1363,17 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
     failures = 0
     last_err = ""
     for i in range(clip_count):
+        clip_last_err = ""
         start = i * max(1, int(pages_per_clip))
         end = min(len(page_texts), start + max(1, int(pages_per_clip)))
         pages = page_texts[start:end]
         if not pages:
             out.append(fallback_clips[i])
             failures += 1
+            if failure_indices is not None:
+                failure_indices.append(i)
+            if failure_reasons is not None:
+                failure_reasons[str(i)] = "该片段没有可用的提取文字"
             continue
 
         parts = []
@@ -1442,6 +1448,7 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                 break
             except Exception as e:
                 last_err = str(e)
+                clip_last_err = last_err
                 retryable = _is_retryable_llm_error(last_err)
                 if retryable and attempt < 3:
                     sleep_s = _llm_retry_delay(e, attempt, rpm)
@@ -1455,6 +1462,10 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                 failures += 1
                 print(f"    AI 旁白 {i + 1}/{clip_count} 失败，回退原文: {e}")
                 out.append(fallback_clips[i])
+                if failure_indices is not None:
+                    failure_indices.append(i)
+                if failure_reasons is not None:
+                    failure_reasons[str(i)] = clip_last_err or str(e)
                 break
 
         if progress_cb:
@@ -1474,6 +1485,23 @@ def generate_ai_narration(page_texts, pages_per_clip, fallback_clips, llm_cfg,
                 print(f"  AI 旁白最终失败: {last_err}")
         return out, note
     return out, ""
+
+
+def generate_ai_narration_segment(page_texts, pages_per_clip, clip_index,
+                                  fallback_text, llm_cfg, progress_cb=None):
+    """Generate one clip's narration without rerunning other clips."""
+    pages_per_clip = max(1, int(pages_per_clip))
+    start = max(0, int(clip_index)) * pages_per_clip
+    selected_pages = page_texts[start:start + pages_per_clip]
+    failures = []
+    reasons = {}
+    result, note = generate_ai_narration(
+        selected_pages, pages_per_clip, [fallback_text], llm_cfg,
+        progress_cb=progress_cb, failure_indices=failures,
+        failure_reasons=reasons)
+    failed = bool(failures)
+    return result[0] if result else fallback_text, failed, (
+        reasons.get("0") or note or "AI 旁白生成失败")
 
 
 def synth_narration(narration, narration_dir, voice, rate, progress_cb=None):

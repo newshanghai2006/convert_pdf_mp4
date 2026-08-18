@@ -58,6 +58,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     overflow:hidden; color:#8c7c63; font-size:11px; text-align:center; }
   .seg-thumb { display:block; width:100%; height:150px; object-fit:contain; }
   .seg-thumb-empty { padding:10px; }
+  .seg-ai-failure { display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+                    margin-top:8px; color:#e88a7a; font-size:12px; }
+  .seg-ai-failure button { padding:6px 10px; font-size:12px; }
   #video-preview { width:100%; border-radius:10px; margin-top:10px; background:#000; display:none; }
   .pill { display:inline-block; background:#3a2c1e; color:#e8c89a; border-radius:20px;
           padding:3px 12px; font-size:12px; margin-left:8px; }
@@ -948,6 +951,8 @@ function renderNarration(arr, st={}){
   $('clip-pill').textContent=arr.length+' 段';
   const list=$('nar-list'); list.innerHTML='';
   const gdur=$('clip_duration').value;
+  const failedIndices=new Set((st.ai_failed_indices||[]).map(Number));
+  const failureReasons=st.ai_failure_reasons||{};
   arr.forEach((t,i)=>{
     const d=document.createElement('div'); d.className='seg-nar';
     const head=document.createElement('div');
@@ -975,7 +980,52 @@ function renderNarration(arr, st={}){
     ta.style.marginTop='0';
     ta.addEventListener('input', ()=>debounceSaveNarration(i, ta.value));
     body.append(thumbWrap,ta);
-    d.appendChild(body); list.appendChild(d);
+    d.appendChild(body);
+    if(failedIndices.has(i)){
+      const failure=document.createElement('div'); failure.className='seg-ai-failure';
+      const failureText=document.createElement('span');
+      failureText.textContent='AI旁白生成失败，当前保留原始文本';
+      const reason=failureReasons[String(i)]||'';
+      if(reason) failureText.title=reason;
+      const retry=document.createElement('button');
+      retry.type='button'; retry.className='btn-2';
+      retry.textContent='单独重试 AI 旁白';
+      retry.onclick=()=>retryAiNarrationSegment(i,retry);
+      failure.append(failureText,retry);
+      d.appendChild(failure);
+    }
+    list.appendChild(d);
+  });
+}
+
+function retryAiNarrationSegment(idx, button){
+  if(!TASK_ID) return;
+  if(!$('llm_base_url').value.trim() || !$('llm_model').value.trim()){
+    alert('请先填写 LLM base_url 和 Model'); return;
+  }
+  saveAiCfg();
+  button.disabled=true; button.textContent='重试中…';
+  $('status1').textContent='正在单独重试第 '+(idx+1)+' 段 AI 旁白…';
+  const payload={
+    task_id:TASK_ID, idx,
+    llm_provider:$('llm_provider').value,
+    llm_base_url:$('llm_base_url').value,
+    llm_api_key:$('llm_api_key').value,
+    llm_model:$('llm_model').value,
+    llm_rpm:$('llm_rpm').value,
+    narration_target_chars:$('narration_target_chars').value,
+  };
+  fetch('/api/regenerate_narration_segment',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).then(async r=>{
+    const result=await r.json();
+    if(!r.ok) throw new Error(result.error||'单段 AI 旁白重试失败');
+    rememberActiveTask('prepare');
+    pollPrepare();
+  }).catch(err=>{
+    button.disabled=false; button.textContent='单独重试 AI 旁白';
+    $('status1').textContent=err.message;
   });
 }
 

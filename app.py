@@ -210,6 +210,7 @@ def _task_snapshot(st):
         "stage", "progress", "message", "pdf_path", "output_path",
         "narration", "clips", "page_count", "srt_ready", "srt_path",
         "pdf_page_count", "output_ready", "page_texts", "fallback_narration",
+        "ai_failed_indices", "ai_failure_reasons",
         "pages_per_clip", "ocr_engine", "compact_ocr_text", "page_range",
         "file_name",
     )
@@ -376,18 +377,28 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
         clips = list(fallback_clips)
         update_task(tid, page_texts=pages,
                     fallback_narration=fallback_clips,
-                    pages_per_clip=pages_per_clip)
+                    pages_per_clip=pages_per_clip,
+                    ai_failed_indices=[], ai_failure_reasons={})
         ai_note = ""
         if llm_cfg.get("enabled"):
+            ai_failed_indices = []
+            ai_failure_reasons = {}
             clips, ai_note = p.generate_ai_narration(
-                pages, pages_per_clip, clips, llm_cfg, cb)
+                pages, pages_per_clip, clips, llm_cfg, cb,
+                failure_indices=ai_failed_indices,
+                failure_reasons=ai_failure_reasons)
+        else:
+            ai_failed_indices = []
+            ai_failure_reasons = {}
         ready_msg = "文字提取完成，可编辑旁白后生成"
         if llm_cfg.get("enabled"):
             ready_msg = f"文字提取完成，{ai_note or 'AI 旁白已生成'}，可编辑后生成视频"
         update_task(tid, stage="ready", progress=1.0,
                     message=ready_msg,
                     narration=clips, clips=len(clips),
-                    page_count=len(pages))
+                    page_count=len(pages),
+                    ai_failed_indices=ai_failed_indices,
+                    ai_failure_reasons=ai_failure_reasons)
     except TaskCancelled:
         update_task(tid, stage="cancelled", message="任务已取消")
     except Exception as e:
@@ -405,16 +416,76 @@ def do_regenerate_narration(tid, pages, pages_per_clip, fallback_clips, llm_cfg)
     try:
         if _task_cancelled(tid):
             raise TaskCancelled()
+        ai_failed_indices = []
+        ai_failure_reasons = {}
         clips, ai_note = _pipeline().generate_ai_narration(
-            pages, pages_per_clip, fallback_clips, llm_cfg, cb)
+            pages, pages_per_clip, fallback_clips, llm_cfg, cb,
+            failure_indices=ai_failed_indices,
+            failure_reasons=ai_failure_reasons)
         message = ai_note or "AI 旁白已重新生成"
         update_task(tid, stage="ready", progress=1.0, message=message,
-                    narration=clips, clips=len(clips), llm_cfg=llm_cfg)
+                    narration=clips, clips=len(clips), llm_cfg=llm_cfg,
+                    ai_failed_indices=ai_failed_indices,
+                    ai_failure_reasons=ai_failure_reasons)
     except TaskCancelled:
         update_task(tid, stage="cancelled", message="任务已取消")
     except Exception as e:
         update_task(tid, stage="ready", progress=1.0,
                     message=f"AI 旁白重新生成失败：{e}；已保留当前旁白")
+    finally:
+        _finalize_pending_delete(tid)
+
+
+def do_regenerate_narration_segment(tid, pages, pages_per_clip,
+                                    clip_index, fallback_text, llm_cfg):
+    def cb(stage, pct, msg):
+        if _task_cancelled(tid):
+            raise TaskCancelled()
+        update_task(tid, stage=stage, progress=pct, message=msg)
+
+    try:
+        if _task_cancelled(tid):
+            raise TaskCancelled()
+        text, failed, reason = _pipeline().generate_ai_narration_segment(
+            pages, pages_per_clip, clip_index, fallback_text, llm_cfg, cb)
+        with TASKS_LOCK:
+            st = TASKS.get(tid)
+            if not st:
+                return
+            narration = list(st.get("narration") or [])
+            failed_indices = set(int(i) for i in
+                                 (st.get("ai_failed_indices") or []))
+            failure_reasons = dict(st.get("ai_failure_reasons") or {})
+            if not failed:
+                if clip_index < len(narration):
+                    narration[clip_index] = text
+                failed_indices.discard(clip_index)
+                failure_reasons.pop(str(clip_index), None)
+                message = f"AI 旁白第 {clip_index + 1} 段重试成功"
+            else:
+                failed_indices.add(clip_index)
+                failure_reasons[str(clip_index)] = reason
+                message = f"AI 旁白第 {clip_index + 1} 段重试失败，已保留原文"
+        update_task(tid, stage="ready", progress=1.0, message=message,
+                    narration=narration,
+                    ai_failed_indices=sorted(failed_indices),
+                    ai_failure_reasons=failure_reasons,
+                    llm_cfg=llm_cfg)
+    except TaskCancelled:
+        update_task(tid, stage="cancelled", message="任务已取消")
+    except Exception as e:
+        with TASKS_LOCK:
+            st = TASKS.get(tid) or {}
+            failed_indices = list(st.get("ai_failed_indices") or [])
+            failure_reasons = dict(st.get("ai_failure_reasons") or {})
+        failure_reasons[str(clip_index)] = str(e)
+        if clip_index not in failed_indices:
+            failed_indices.append(clip_index)
+        update_task(tid, stage="ready", progress=1.0,
+                    message=f"AI 旁白第 {clip_index + 1} 段重试失败，已保留原文",
+                    ai_failed_indices=sorted(set(failed_indices)),
+                    ai_failure_reasons=failure_reasons,
+                    llm_cfg=llm_cfg)
     finally:
         _finalize_pending_delete(tid)
 
@@ -728,6 +799,7 @@ def api_prepare():
             "output_path": out_path, "output_ready": False,
             "narration": [], "clips": 0, "page_count": 0,
             "pdf_page_count": 0,
+            "ai_failed_indices": [], "ai_failure_reasons": {},
             "srt_ready": False, "srt_path": "",
             "llm_cfg": llm_cfg,
             "ai_ocr_cfg": ai_ocr_cfg,
@@ -770,6 +842,8 @@ def api_status():
             "page_count": st["page_count"],
             "pdf_page_count": st.get("pdf_page_count", 0),
             "narration": st.get("narration", []),
+            "ai_failed_indices": st.get("ai_failed_indices", []),
+            "ai_failure_reasons": st.get("ai_failure_reasons", {}),
             "output_ready": st["output_ready"],
             "srt_ready": st.get("srt_ready", False),
             "voice": voice,
@@ -853,6 +927,68 @@ def api_regenerate_narration():
     t = threading.Thread(
         target=do_regenerate_narration,
         args=(tid, pages, pages_per_clip, fallback_clips, llm_cfg))
+    t.daemon = True
+    t.start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/regenerate_narration_segment", methods=["POST"])
+def api_regenerate_narration_segment():
+    owner_hash, error = _require_owner()
+    if error:
+        return error
+    data = request.get_json(force=True)
+    tid = data.get("task_id")
+    st = _get_owned_task(tid, owner_hash)
+    if not st:
+        return jsonify({"error": "not found"}), 404
+    try:
+        clip_index = int(data.get("idx", -1))
+    except (TypeError, ValueError):
+        clip_index = -1
+    with TASKS_LOCK:
+        if st["stage"] not in ("ready", "done"):
+            return jsonify({"error": "task is busy"}), 400
+        pages = list(st.get("page_texts") or [])
+        fallback_clips = list(st.get("fallback_narration") or [])
+        pages_per_clip = int(st.get("pages_per_clip") or 1)
+        stored_cfg = dict(st.get("llm_cfg") or {})
+    if not pages or not fallback_clips:
+        return jsonify({"error": "当前任务没有可复用的提取文字，请重新载入 PDF"}), 400
+    if clip_index < 0 or clip_index >= len(fallback_clips):
+        return jsonify({"error": "片段编号无效"}), 400
+
+    try:
+        target_chars = int(data.get("narration_target_chars", 200))
+    except (TypeError, ValueError):
+        target_chars = 200
+    llm_cfg = {
+        "enabled": True,
+        "provider": str(data.get("llm_provider") or
+                        stored_cfg.get("provider") or "openai").strip().lower(),
+        "base_url": str(data.get("llm_base_url") or
+                        stored_cfg.get("base_url") or "").strip(),
+        "api_key": str(data.get("llm_api_key") or
+                       stored_cfg.get("api_key") or "").strip(),
+        "model": str(data.get("llm_model") or
+                     stored_cfg.get("model") or "").strip(),
+        "llm_rpm": _bounded_rpm(
+            data.get("llm_rpm") if data.get("llm_rpm") is not None
+            else stored_cfg.get("llm_rpm", 0)),
+        "narration_target_chars": max(40, min(400, target_chars)),
+    }
+    if llm_cfg["provider"] not in ("openai", "nvidia", "sensenova"):
+        llm_cfg["provider"] = "openai"
+    if not llm_cfg["base_url"] or not llm_cfg["model"]:
+        return jsonify({"error": "请填写 LLM base_url 和 Model"}), 400
+
+    update_task(tid, stage="ai_segment", progress=0.55,
+                message=f"正在重试第 {clip_index + 1} 段 AI 旁白",
+                llm_cfg=llm_cfg)
+    t = threading.Thread(
+        target=do_regenerate_narration_segment,
+        args=(tid, pages, pages_per_clip, clip_index,
+              fallback_clips[clip_index], llm_cfg))
     t.daemon = True
     t.start()
     return jsonify({"ok": True})
