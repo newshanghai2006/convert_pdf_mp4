@@ -28,6 +28,7 @@ from urllib import error as urlerror
 import fitz
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import edge_tts
+from _ocr_layout import detect_spread_split
 
 W, H = 1920, 1080   # 默认输出尺寸（16:9 1080p）；实际由参数计算，见 compute_dimensions
 
@@ -198,7 +199,8 @@ def make_working_pdf(src_path, out_path, spec):
 def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
                        ocr_worker=None, py_exe=None, ocr_lang="ch_sim",
                        probe_ocr=False, ai_ocr_cfg=None,
-                       ocr_engine="easyocr"):
+                       ocr_engine="easyocr", ocr_layout_mode="auto",
+                       ocr_spread_order="ltr"):
     """返回 list[str]，每页一段文字。文字层优先；若全空且 use_ocr，则跑 OCR。
     ocr_lang: 'ch_sim'(简体) 或 'ch_tra'(繁体)，均搭配英文。"""
     doc = fitz.open(pdf_path)
@@ -223,7 +225,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
             if os.path.exists(out_txt):
                 os.remove(out_txt)
             ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
-                               ocr_lang, ocr_engine)
+                               ocr_lang, ocr_engine, ocr_layout_mode,
+                               ocr_spread_order)
             return parse_ocr_txt(out_txt, N)
 
         # 样本里有文字层，再做全量提取
@@ -263,7 +266,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
                     (ai_ocr_cfg or {}).get("enabled") else "未检测到文字层，开始 OCR")
 
     if (ai_ocr_cfg or {}).get("enabled"):
-        return generate_ai_ocr(pdf_path, pages, ai_ocr_cfg, progress_cb)
+        return generate_ai_ocr(pdf_path, pages, ai_ocr_cfg, progress_cb,
+                               ocr_layout_mode, ocr_spread_order)
 
     # OCR 结果放在任务自己的目录下（不再用进程 PID 命名的公共临时文件，
     # 否则同一 Flask 进程里并发的两个任务会写到同一个文件、互相污染）。
@@ -271,7 +275,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
     if os.path.exists(out_txt):
         os.remove(out_txt)
     ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
-                       ocr_lang, ocr_engine)
+                       ocr_lang, ocr_engine, ocr_layout_mode,
+                       ocr_spread_order)
     return parse_ocr_txt(out_txt, N)
 
 
@@ -285,7 +290,8 @@ def get_pdf_page_count(pdf_path):
 
 
 def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
-                       ocr_lang="ch_sim", ocr_engine="easyocr"):
+                       ocr_lang="ch_sim", ocr_engine="easyocr",
+                       ocr_layout_mode="auto", ocr_spread_order="ltr"):
     """
     以子进程跑 OCR。一次子进程处理「所有剩余页」，把 torch/easyocr 的加载成本
     只付一次；子进程中途崩溃则重新拉起、从断点续跑。
@@ -301,6 +307,10 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
     py_exe = py_exe or sys.executable
     if ocr_engine not in ("easyocr", "rapidocr", "paddleocr"):
         ocr_engine = "easyocr"
+    if ocr_layout_mode not in ("auto", "single", "spread", "magazine"):
+        ocr_layout_mode = "auto"
+    if ocr_spread_order not in ("ltr", "rtl"):
+        ocr_spread_order = "ltr"
     N = fitz.open(pdf_path).page_count
     max_stalls = 3           # 连续无进展的最大次数
     stalls = 0
@@ -339,7 +349,7 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
             ef = open(err_log, "w", encoding="utf-8", errors="replace")
             proc = subprocess.Popen(
                 [py_exe, ocr_worker, pdf_path, str(done), str(N), out_txt,
-                 ocr_lang, ocr_engine],
+                 ocr_lang, ocr_engine, ocr_layout_mode, ocr_spread_order],
                 stdout=subprocess.DEVNULL, stderr=ef, text=True, env=env)
         except Exception as e:
             last_err = f"无法启动 OCR 子进程: {e}"
@@ -472,7 +482,13 @@ def group_into_clips(page_texts, pages_per_clip):
     groups = []
     for c in range(clips):
         chunk = page_texts[c * pages_per_clip:(c + 1) * pages_per_clip]
-        groups.append("\n".join(t for t in chunk if t.strip()))
+        cleaned = []
+        for text in chunk:
+            text = re.sub(
+                r"(?m)^【(?:左页|右页|整页|版块\s*\d+)】\s*$", "", text or "")
+            if text.strip():
+                cleaned.append(text.strip())
+        groups.append("\n".join(cleaned))
     return groups
 
 
@@ -1144,11 +1160,7 @@ def _call_openai_chat(base_url, api_key, model, messages, temperature=0.4,
     return str(content).strip()
 
 
-def _pdf_page_data_url(page, max_size=1800):
-    """Render one PDF page as a reasonably sized JPEG data URL for vision APIs."""
-    pix = page.get_pixmap(matrix=fitz.Matrix(150 / 72.0, 150 / 72.0),
-                          alpha=False)
-    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+def _image_data_url(img, max_size=1800):
     if max(img.size) > max_size:
         scale = max_size / float(max(img.size))
         img = img.resize((max(1, int(img.width * scale)),
@@ -1159,7 +1171,26 @@ def _pdf_page_data_url(page, max_size=1800):
     return "data:image/jpeg;base64," + encoded
 
 
-def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None):
+def _pdf_page_images(page, layout_mode="auto", spread_order="ltr"):
+    pix = page.get_pixmap(matrix=fitz.Matrix(150 / 72.0, 150 / 72.0),
+                          alpha=False)
+    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    split = None
+    if layout_mode in ("auto", "spread"):
+        split = detect_spread_split(image, force=layout_mode == "spread")
+    if split is None:
+        return [("整页", _image_data_url(image))]
+    regions = [
+        ("左页", image.crop((0, 0, split, image.height))),
+        ("右页", image.crop((split, 0, image.width, image.height))),
+    ]
+    if spread_order == "rtl":
+        regions.reverse()
+    return [(label, _image_data_url(region)) for label, region in regions]
+
+
+def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None,
+                    layout_mode="auto", spread_order="ltr"):
     """Recognize image-only PDF pages through an OpenAI-compatible vision model."""
     base_url = (llm_cfg or {}).get("base_url", "")
     api_key = (llm_cfg or {}).get("api_key", "")
@@ -1169,10 +1200,17 @@ def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None):
 
     rpm = _resolve_llm_rpm(llm_cfg)
     provider_label = _llm_provider_label(llm_cfg)
+    layout_instruction = {
+        "single": "这是普通单页，请按从上到下的正常阅读顺序输出。",
+        "spread": "这是左右双页，图片已按设定顺序拆分；先完成前一页，再处理后一页。",
+        "magazine": "这是多栏杂志版面，请先识别独立版块和分栏，再按版块阅读顺序输出。",
+        "auto": "请判断单页、多栏或左右跨页结构，并按实际版面的正常阅读顺序输出。",
+    }.get(layout_mode, "请按实际版面的正常阅读顺序输出。")
     prompts = (
-        "请准确识别这张 PDF 页面中的所有可见文字。按正常阅读顺序输出，"
-        "尽量保留标题、段落和换行；不要补写图片中没有的内容，不要解释识别过程。"
-        "如果页面主要是图片且没有文字，只输出空文本。"
+        "请准确识别 PDF 页面中的所有可见文字。" + layout_instruction +
+        "同一栏内从上到下，多栏按栏依次处理；标题、正文和图片说明不要互相穿插。"
+        "用空行分隔不同版块，尽量保留标题、段落和换行；不要补写图片中没有的内容，"
+        "不要解释识别过程。如果页面主要是图片且没有文字，只输出空文本。"
     )
     doc = fitz.open(pdf_path)
     out = []
@@ -1187,13 +1225,16 @@ def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None):
                     llm_cfg, rpm, progress_cb, "ai_ocr",
                     i / max(1, total), f"{provider_label} AI OCR")
                 try:
+                    content = [{"type": "text", "text": prompts}]
+                    for label, data_url in _pdf_page_images(
+                            doc[i], layout_mode, spread_order):
+                        content.extend([
+                            {"type": "text", "text": f"以下图片区域为：{label}"},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ])
                     raw = _call_openai_chat(
                         base_url, api_key, model,
-                        [{"role": "user", "content": [
-                            {"type": "text", "text": prompts},
-                            {"type": "image_url", "image_url": {
-                                "url": _pdf_page_data_url(doc[i])}}
-                        ]}],
+                        [{"role": "user", "content": content}],
                         temperature=0.0, max_tokens=4096, timeout=180)
                     text = _clean_ai_text(raw)
                     out.append(text)

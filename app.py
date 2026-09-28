@@ -211,7 +211,8 @@ def _task_snapshot(st):
         "narration", "clips", "page_count", "srt_ready", "srt_path",
         "pdf_page_count", "output_ready", "page_texts", "fallback_narration",
         "ai_failed_indices", "ai_failure_reasons",
-        "pages_per_clip", "ocr_engine", "compact_ocr_text", "page_range",
+        "pages_per_clip", "ocr_engine", "ocr_layout_mode",
+        "ocr_spread_order", "compact_ocr_text", "page_range",
         "file_name",
     )
     snap = {key: st.get(key) for key in keys if key in st}
@@ -338,7 +339,8 @@ def update_task(tid, **kw):
 # 后台：提取文字
 # ---------------------------------------------------------------------------
 def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
-               page_range="", ai_ocr_cfg=None, ocr_engine="easyocr"):
+               page_range="", ai_ocr_cfg=None, ocr_engine="easyocr",
+               ocr_layout_mode="auto", ocr_spread_order="ltr"):
     def cb(stage, pct, msg):
         if _task_cancelled(tid):
             raise TaskCancelled()
@@ -367,7 +369,8 @@ def do_prepare(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang="ch_sim",
             pdf_path, use_ocr=use_ocr, progress_cb=cb,
             ocr_worker=OCR_WORKER, py_exe=__import__("sys").executable,
             ocr_lang=ocr_lang, probe_ocr=probe_ocr, ai_ocr_cfg=ai_ocr_cfg,
-            ocr_engine=ocr_engine)
+            ocr_engine=ocr_engine, ocr_layout_mode=ocr_layout_mode,
+            ocr_spread_order=ocr_spread_order)
         fallback_clips = p.group_into_clips(pages, pages_per_clip)
         if compact_ocr_text:
             fallback_clips = [
@@ -782,6 +785,16 @@ def api_prepare():
     ocr_engine = request.form.get("ocr_engine", "easyocr").strip().lower()
     if ocr_engine not in ("easyocr", "rapidocr", "paddleocr"):
         ocr_engine = "easyocr"
+    ocr_layout_mode = request.form.get(
+        "ocr_layout_mode", "auto").strip().lower()
+    if ocr_layout_mode not in ("auto", "single", "spread", "magazine"):
+        ocr_layout_mode = "auto"
+    ocr_spread_order = request.form.get(
+        "ocr_spread_order", "ltr").strip().lower()
+    if ocr_spread_order not in ("ltr", "rtl"):
+        ocr_spread_order = "ltr"
+    ai_ocr_cfg["layout_mode"] = ocr_layout_mode
+    ai_ocr_cfg["spread_order"] = ocr_spread_order
 
     tid = uuid.uuid4().hex
     work = os.path.join(UPLOAD_DIR, tid)
@@ -804,6 +817,8 @@ def api_prepare():
             "llm_cfg": llm_cfg,
             "ai_ocr_cfg": ai_ocr_cfg,
             "ocr_engine": ocr_engine,
+            "ocr_layout_mode": ocr_layout_mode,
+            "ocr_spread_order": ocr_spread_order,
             "compact_ocr_text": compact_ocr_text,
             "page_range": page_range,
             "file_name": os.path.basename(f.filename)[:255] or fname,
@@ -815,7 +830,8 @@ def api_prepare():
     TASK_STORE.create_task(tid, owner_hash, initial_state)
     t = threading.Thread(target=do_prepare,
                          args=(tid, pdf_path, pages_per_clip, use_ocr, ocr_lang,
-                               page_range, ai_ocr_cfg, ocr_engine))
+                               page_range, ai_ocr_cfg, ocr_engine,
+                               ocr_layout_mode, ocr_spread_order))
     t.daemon = True
     t.start()
     return jsonify({"task_id": tid})

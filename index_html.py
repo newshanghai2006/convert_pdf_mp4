@@ -211,10 +211,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </select>
       </label>
       <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
+        OCR版面
+        <select id="ocr_layout_mode" style="width:auto;padding:6px 8px;">
+          <option value="auto" selected>自动检测（推荐）</option>
+          <option value="single">普通单页</option>
+          <option value="spread">左右双页</option>
+          <option value="magazine">多栏杂志</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
+        双页顺序
+        <select id="ocr_spread_order" style="width:auto;padding:6px 8px;">
+          <option value="ltr" selected>左页 → 右页</option>
+          <option value="rtl">右页 → 左页</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;color:#cbb79a;font-size:13px;">
         <input type="checkbox" id="compact_ocr_text" checked> 去除提取文字中的换行和空格
       </label>
     </div>
-    <div class="hint">繁体材料请选「繁体中文」（简繁模型不同，不能混识别；首次用繁体需联网下载繁体模型）。</div>
+    <div class="hint">双页扫描可强制选择「左右双页」；多栏模式会利用文字框坐标按版块和分栏恢复阅读顺序。繁体材料请选「繁体中文」。</div>
     <div class="bar"><i id="bar1"></i></div>
     <div id="status1"></div>
   </div>
@@ -584,12 +600,18 @@ function saveAiCfg(){
 function saveOcrCfg(){
   try { localStorage.setItem(OCR_CFG_KEY, JSON.stringify({
     ocr_engine: $('ocr_engine').value,
+    ocr_layout_mode: $('ocr_layout_mode').value,
+    ocr_spread_order: $('ocr_spread_order').value,
     compact_ocr_text: $('compact_ocr_text').checked,
   })); } catch(e){}
 }
 function loadOcrCfg(){
   try { return JSON.parse(localStorage.getItem(OCR_CFG_KEY) || '{}') || {}; }
   catch(e){ return {}; }
+}
+function updateOcrLayoutUi(){
+  const mode=$('ocr_layout_mode').value;
+  $('ocr_spread_order').disabled=!(mode==='auto'||mode==='spread');
 }
 function saveSubtitleCfg(){
   const data = {
@@ -702,9 +724,14 @@ syncAiCfgUi();
 loadRemoteApiSettings();
 const savedOcrCfg = loadOcrCfg();
 if (savedOcrCfg.ocr_engine) $('ocr_engine').value = savedOcrCfg.ocr_engine;
+if (savedOcrCfg.ocr_layout_mode) $('ocr_layout_mode').value = savedOcrCfg.ocr_layout_mode;
+if (savedOcrCfg.ocr_spread_order) $('ocr_spread_order').value = savedOcrCfg.ocr_spread_order;
 if (savedOcrCfg.compact_ocr_text !== undefined) $('compact_ocr_text').checked = !!savedOcrCfg.compact_ocr_text;
 $('ocr_engine').addEventListener('change', saveOcrCfg);
+$('ocr_layout_mode').addEventListener('change', ()=>{ updateOcrLayoutUi(); saveOcrCfg(); });
+$('ocr_spread_order').addEventListener('change', saveOcrCfg);
 $('compact_ocr_text').addEventListener('change', saveOcrCfg);
+updateOcrLayoutUi();
 const savedSubtitleCfg = loadSubtitleCfg();
 ['subtitle_mode','subtitle_zh_color','subtitle_en_color','subtitle_outline_color'].forEach(id=>{
   if(savedSubtitleCfg[id] !== undefined) $(id).value = savedSubtitleCfg[id];
@@ -836,6 +863,8 @@ $('btn-prepare').onclick=()=>{
   fd.append('pages_per_clip', $('pages_per_clip').value);
   fd.append('use_ocr', $('use_ocr').checked ? 'true':'false');
   fd.append('ocr_engine', $('ocr_engine').value);
+  fd.append('ocr_layout_mode', $('ocr_layout_mode').value);
+  fd.append('ocr_spread_order', $('ocr_spread_order').value);
   fd.append('compact_ocr_text', $('compact_ocr_text').checked ? 'true':'false');
   fd.append('use_ai_narration', $('use_ai_narration').checked ? 'true':'false');
   fd.append('use_ai_ocr', $('use_ai_ocr').checked ? 'true':'false');

@@ -14,6 +14,7 @@ OCR worker：被 pipeline.ocr_pdf_subprocess 以子进程方式调用。
     （避免 JPEG 压缩损失，也不再残留 _ocr_tmp_*.jpg）。
 
 用法: py _ocr_worker.py <pdf> <start> <end> <out_txt> [lang] [engine]
+      [layout_mode] [spread_order]
       start/end 为 0-based 索引（end 不含），engine 默认为 easyocr
 """
 import sys
@@ -31,6 +32,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import numpy as np
 import fitz
 from PIL import Image
+from _ocr_layout import detect_spread_split, layout_groups, make_record
 
 PDF = sys.argv[1]
 START = int(sys.argv[2])
@@ -44,6 +46,12 @@ if LANG not in ("ch_sim", "ch_tra"):
 OCR_ENGINE = sys.argv[6].strip().lower() if len(sys.argv) > 6 else "easyocr"
 if OCR_ENGINE not in ("easyocr", "rapidocr", "paddleocr"):
     OCR_ENGINE = "easyocr"
+LAYOUT_MODE = sys.argv[7].strip().lower() if len(sys.argv) > 7 else "auto"
+if LAYOUT_MODE not in ("auto", "single", "spread", "magazine"):
+    LAYOUT_MODE = "auto"
+SPREAD_ORDER = sys.argv[8].strip().lower() if len(sys.argv) > 8 else "ltr"
+if SPREAD_ORDER not in ("ltr", "rtl"):
+    SPREAD_ORDER = "ltr"
 
 # 渲染分辨率：越高越清晰但越慢、越费内存。
 RENDER_ZOOM = float(os.getenv("OCR_RENDER_ZOOM", str(150 / 72.0)))
@@ -130,8 +138,16 @@ def _json_value(value):
     return value
 
 
-def _paddle_lines(result):
-    """Read text from PaddleOCR 2.x nested lists or 3.x result objects."""
+def _first_value(data, *names):
+    for name in names:
+        value = data.get(name)
+        if value is not None:
+            return value.tolist() if hasattr(value, "tolist") else value
+    return []
+
+
+def _paddle_records(result):
+    """Read positioned text from PaddleOCR 2.x lists or 3.x objects."""
     def is_old_line(value):
         if not (isinstance(value, (list, tuple)) and len(value) >= 2):
             return False
@@ -145,63 +161,129 @@ def _paddle_lines(result):
         items = list(result)
     else:
         items = [result]
-    lines = []
+    records = []
     for item in items:
         data = _json_value(item)
         if isinstance(data, dict):
             if isinstance(data.get("res"), dict):
                 data = data["res"]
-            texts = data.get("rec_texts") or data.get("texts") or []
-            lines.extend(str(x).strip() for x in texts if str(x).strip())
+            texts = _first_value(data, "rec_texts", "texts")
+            boxes = _first_value(
+                data, "rec_polys", "dt_polys", "rec_boxes", "boxes")
+            scores = _first_value(data, "rec_scores", "scores")
+            for index, text in enumerate(texts):
+                if index >= len(boxes):
+                    continue
+                score = scores[index] if index < len(scores) else 1.0
+                record = make_record(text, boxes[index], score)
+                if record:
+                    records.append(record)
             continue
         if not isinstance(item, (list, tuple)):
             continue
         if is_old_line(item):
-            pages = [item]
+            lines = [item]
         elif item and is_old_line(item[0]):
-            pages = [item]
+            lines = item
         else:
-            pages = item
-        for line in pages:
+            lines = []
+            for page in item:
+                if isinstance(page, (list, tuple)) and page and is_old_line(page[0]):
+                    lines.extend(page)
+        for line in lines:
             if not isinstance(line, (list, tuple)) or len(line) < 2:
                 continue
             info = line[1]
             text = info[0] if isinstance(info, (list, tuple)) else info
-            if text and str(text).strip():
-                lines.append(str(text).strip())
-    return lines
+            score = (info[1] if isinstance(info, (list, tuple)) and
+                     len(info) > 1 else 1.0)
+            record = make_record(text, line[0], score)
+            if record:
+                records.append(record)
+    return records
 
 
-def _rapid_lines(result):
+def _rapid_records(result):
     if isinstance(result, tuple):
         result = result[0]
-    lines = []
+    records = []
     for item in result or []:
         if isinstance(item, dict):
             text = item.get("text") or item.get("txt") or ""
+            box = _first_value(item, "box", "points", "dt_poly")
+            score = item.get("score", item.get("confidence", 1.0))
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            text = item[1]
+            box, text = item[0], item[1]
+            score = item[2] if len(item) > 2 else 1.0
         else:
-            text = ""
-        if text and str(text).strip():
-            lines.append(str(text).strip())
-    return lines
+            continue
+        record = make_record(text, box, score)
+        if record:
+            records.append(record)
+    return records
 
 
-def recognize(image, reader):
+def recognize_records(image, reader):
     if OCR_ENGINE == "easyocr":
-        return [str(x).strip() for x in reader.readtext(
-            np.array(image), detail=0, paragraph=False,
-            canvas_size=CANVAS_SIZE, mag_ratio=MAG_RATIO,
-            workers=0, batch_size=1) if str(x).strip()]
+        records = []
+        for item in reader.readtext(
+                np.array(image), detail=1, paragraph=False,
+                canvas_size=CANVAS_SIZE, mag_ratio=MAG_RATIO,
+                workers=0, batch_size=1):
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            score = item[2] if len(item) > 2 else 1.0
+            record = make_record(item[1], item[0], score)
+            if record:
+                records.append(record)
+        return records
 
     # ONNX/Paddle implementations conventionally expect BGR arrays.
     bgr = np.array(image)[:, :, ::-1]
     if OCR_ENGINE == "rapidocr":
-        return _rapid_lines(reader(bgr))
+        return _rapid_records(reader(bgr))
     if hasattr(reader, "predict"):
-        return _paddle_lines(reader.predict(input=bgr))
-    return _paddle_lines(reader.ocr(bgr, cls=True))
+        return _paddle_records(reader.predict(input=bgr))
+    return _paddle_records(reader.ocr(bgr, cls=True))
+
+
+def _format_region(image, reader, label=None, multi_column=True):
+    records = recognize_records(image, reader)
+    groups = layout_groups(records, image.width, image.height,
+                           multi_column=multi_column)
+    parts = [f"【{label}】"] if label else []
+    for index, group in enumerate(groups):
+        if len(groups) > 1:
+            parts.append(f"【版块 {index + 1}】")
+        parts.extend(item["text"] for item in group)
+        if index + 1 < len(groups):
+            parts.append("")
+    return parts
+
+
+def recognize_layout(image, reader):
+    force_spread = LAYOUT_MODE == "spread"
+    split = None
+    if LAYOUT_MODE in ("auto", "spread"):
+        split = detect_spread_split(image, force=force_spread)
+    if split is None:
+        return _format_region(
+            image, reader,
+            multi_column=LAYOUT_MODE in ("auto", "magazine"))
+
+    regions = [
+        ("左页", image.crop((0, 0, split, image.height))),
+        ("右页", image.crop((split, 0, image.width, image.height))),
+    ]
+    if SPREAD_ORDER == "rtl":
+        regions.reverse()
+    lines = []
+    for index, (label, region) in enumerate(regions):
+        lines.extend(_format_region(region, reader, label=label,
+                                    multi_column=True))
+        if index + 1 < len(regions):
+            lines.append("")
+    return lines
 
 
 reader = _load_reader()
@@ -216,7 +298,7 @@ with open(OUT, "a", encoding="utf-8") as f:
         try:
             pix = doc[i].get_pixmap(matrix=mat)
             im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            lines = recognize(im, reader)
+            lines = recognize_layout(im, reader)
         except Exception as e:  # 单页失败：写空页，保证进度前进
             lines = []
             print(f"PAGE_ERROR {i+1}: {e}", flush=True)
