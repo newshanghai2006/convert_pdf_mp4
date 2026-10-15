@@ -209,6 +209,7 @@ def _task_snapshot(st):
     keys = (
         "stage", "progress", "message", "pdf_path", "output_path",
         "narration", "clips", "page_count", "srt_ready", "srt_path",
+        "srt_language",
         "pdf_page_count", "output_ready", "page_texts", "fallback_narration",
         "ai_failed_indices", "ai_failure_reasons",
         "pages_per_clip", "ocr_engine", "ocr_layout_mode",
@@ -510,12 +511,18 @@ def do_generate(tid, pdf_path, params, narration):
         res = _pipeline().build_video(pdf_path, out_path, params, narration, cb)
         if res:
             srt_path = os.path.splitext(out_path)[0] + ".srt"
-            srt_ready = (params.get("subtitle_mode") in
-                         ("srt", "burn", "burn_bilingual")
+            subtitle_mode = params.get("subtitle_mode")
+            srt_ready = (subtitle_mode in
+                         ("srt", "srt_traditional", "burn", "burn_bilingual")
                          and os.path.exists(srt_path))
+            srt_language = {
+                "srt_traditional": "zh-Hant",
+                "burn_bilingual": "zh-en",
+            }.get(subtitle_mode, "zh-Hans")
             update_task(tid, stage="done", progress=1.0,
                         message="视频生成完成", output_ready=True,
-                        srt_path=srt_path, srt_ready=srt_ready)
+                        srt_path=srt_path, srt_ready=srt_ready,
+                        srt_language=srt_language)
         else:
             update_task(tid, stage="error", message="视频合成失败，请查看服务端日志")
     except TaskCancelled:
@@ -813,7 +820,7 @@ def api_prepare():
             "narration": [], "clips": 0, "page_count": 0,
             "pdf_page_count": 0,
             "ai_failed_indices": [], "ai_failure_reasons": {},
-            "srt_ready": False, "srt_path": "",
+            "srt_ready": False, "srt_path": "", "srt_language": "",
             "llm_cfg": llm_cfg,
             "ai_ocr_cfg": ai_ocr_cfg,
             "ocr_engine": ocr_engine,
@@ -862,6 +869,7 @@ def api_status():
             "ai_failure_reasons": st.get("ai_failure_reasons", {}),
             "output_ready": st["output_ready"],
             "srt_ready": st.get("srt_ready", False),
+            "srt_language": st.get("srt_language", ""),
             "voice": voice,
             "voice_label": VOICE_LABELS.get(voice, ""),
             "rate": generation_params.get("rate", ""),
@@ -1037,7 +1045,8 @@ def api_generate():
     except Exception:
         clip_durs = []
     subtitle_mode = data.get("subtitle_mode", "none")
-    if subtitle_mode not in ("none", "srt", "burn", "burn_bilingual"):
+    if subtitle_mode not in (
+            "none", "srt", "srt_traditional", "burn", "burn_bilingual"):
         subtitle_mode = "none"
     llm_cfg = {
         "provider": str(data.get("llm_provider") or
@@ -1098,6 +1107,7 @@ def api_generate():
                  "（复用已提取文字，不会重新执行 OCR）"),
         output_ready=False,
         srt_ready=False,
+        srt_language="",
         generation_params=params,
     )
     t = threading.Thread(target=do_generate, args=(tid, pdf_path, params, narration))
@@ -1131,11 +1141,14 @@ def api_download_srt(tid):
         if not st.get("srt_ready"):
             return jsonify({"error": "not ready"}), 404
         srt_path = st.get("srt_path", "")
+        srt_language = st.get("srt_language", "")
     if not srt_path or not os.path.exists(srt_path):
         return jsonify({"error": "not found"}), 404
     return send_file(srt_path, mimetype="application/x-subrip",
                      as_attachment=True,
-                     download_name="AI_PDF_subtitles.srt",
+                     download_name=("AI_PDF_subtitles_zh-Hant.srt"
+                                    if srt_language == "zh-Hant"
+                                    else "AI_PDF_subtitles.srt"),
                      conditional=True)
 
 
@@ -1172,7 +1185,7 @@ def _preflight():
     print(f"  ffmpeg : {'OK ' + ff if ff else '缺失! 请安装 ffmpeg 并加入 PATH'}", flush=True)
     fp = shutil.which("ffprobe")
     print(f"  ffprobe: {'OK ' + fp if fp else '缺失! 请安装 ffmpeg(含 ffprobe)'}", flush=True)
-    for mod in ("flask", "fitz", "PIL", "edge_tts", "easyocr",
+    for mod in ("flask", "fitz", "PIL", "edge_tts", "opencc", "easyocr",
                 "rapidocr_onnxruntime", "paddleocr", "paddle"):
         try:
             ok = importlib.util.find_spec(mod) is not None

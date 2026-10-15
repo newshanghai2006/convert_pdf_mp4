@@ -59,7 +59,7 @@ mk_dzdy/
 
 ```bat
 py -3.14 -m pip install --upgrade pip
-py -3.14 -m pip install flask PyMuPDF Pillow "edge-tts>=7.3.1" numpy
+py -3.14 -m pip install flask PyMuPDF Pillow "edge-tts>=7.3.1" numpy opencc-python-reimplemented
 ```
 
 **本地 OCR 是可选的**（只有纯图片/扫描 PDF 才需要）。三种本地引擎按需安装：
@@ -90,6 +90,7 @@ AI PDF解说视频生成器 启动自检
   fitz    : OK
   PIL     : OK
   edge_tts: OK
+  opencc  : OK
   easyocr : OK
   rapidocr_onnxruntime: OK
   paddleocr : OK
@@ -244,9 +245,10 @@ py -3.14 app.py
   内容页统一等比缩放并居中留边（深色背景），不会变形。
 - 分辨率越高越清晰但编码越慢；竖屏放横向跨页(每片段 2 页)会留很大黑边，建议竖屏时把「每片段页数」设为 1。
 
-**字幕（可选）**：第③步的「字幕」下拉可选四种：
+**字幕（可选）**：第③步的「字幕」下拉可选：
 - **不生成字幕**（默认）。
 - **生成 SRT 字幕文件**：视频旁另存 `output.srt`，生成完成后网页多一个「下载 SRT 字幕」链接。字幕是**软字幕**，不写进画面，可在剪辑软件/播放器里二次编辑。
+- **生成 SRT 繁体中文字幕**：使用 OpenCC 将编辑后的简体中文旁白转换为繁体中文，单独下载 `AI_PDF_subtitles_zh-Hant.srt`；文件采用 UTF-8 BOM，时间轴与配音保持一致，不烧录进视频。
 - **把字幕烧进画面**（硬字幕）：字幕**永久烧录**在画面底部、始终显示（同时也会生成 SRT）。需要对视频重新编码，比不烧字幕稍慢。
 - **中英双语硬字幕**：中文在上、AI 翻译的英文在下，同时生成包含中英文两行的 SRT。中文使用微软雅黑粗体，英文使用 Arial 粗体，并带深色描边。
 
@@ -348,7 +350,7 @@ RapidOCR 会使用 ONNX 模型，PaddleOCR 也可能在首次运行时准备模�
 ## 七、依赖与环境（安装步骤见「二」）
 
 - Python 3.14（`py -3.14`），需安装：
-  - `flask`、`PyMuPDF`(即 `fitz`)、`Pillow`、`edge-tts`、`numpy`
+  - `flask`、`PyMuPDF`(即 `fitz`)、`Pillow`、`edge-tts`、`numpy`、`opencc-python-reimplemented`
   - 本地 OCR 三选一：`easyocr`（含 `torch`）、`rapidocr_onnxruntime` 或 `paddleocr` + `paddlepaddle`
 - 系统需有 `ffmpeg`（8.x，含 `ffprobe`，在 PATH）。
 - **联网要求**：配音（edge-tts）生成时需能访问微软语音服务；选定的 OCR 引擎首次可能需联网准备模型；AI OCR 需要 LLM API 网络。
@@ -380,6 +382,11 @@ RapidOCR 会使用 ONNX 模型，PaddleOCR 也可能在首次运行时准备模�
   的鉴权已失效；执行 `py -3.14 -m pip install --upgrade edge-tts`，重启程序后重试。若是连接超时、
   DNS 或无法建立连接，再检查是否能访问 `speech.platform.bing.com`，以及防火墙和系统代理设置。
   说明：**个别**片段偶发失败会自动改为该片段静音并继续；只有**所有**旁白都失败（整体连不上）时才会报错中止。
+
+- **Q：同时出现 Werkzeug `MemoryError` 和 FFmpeg `Error submitting video frame to the encoder`？**
+  A：这是 Windows 内存提交额度或页面文件接近上限，通常不是某一页图片损坏。关闭占用内存较多的
+  浏览器、办公和同步程序后，对原任务重新点击「生成视频」即可，OCR 与 AI 旁白不会重做。程序默认将
+  x264 编码线程限制为 2 个以降低峰值内存；服务器可设置环境变量 `MK_DZDY_X264_THREADS=1` 进一步节省内存。
 
 - **Q：OCR 很慢？**
   A：CPU 上识别速度取决于所选引擎和页面复杂度。可减少页数或先在有文字层的 PDF 上关掉 OCR；

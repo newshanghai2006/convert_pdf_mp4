@@ -77,6 +77,19 @@ def run_ffmpeg(cmd, desc="ffmpeg"):
     if result.returncode != 0:
         print(f"  ERROR in {desc}:")
         print(f"  {result.stderr[-800:]}")
+        low_memory_markers = (
+            "error submitting video frame to the encoder",
+            "error encoding a frame: generic error in an external library",
+            "cannot allocate memory",
+            "not enough memory",
+        )
+        stderr_lower = result.stderr.lower()
+        if any(marker in stderr_lower for marker in low_memory_markers):
+            raise RuntimeError(
+                "视频编码器内存不足。请关闭占用内存较多的浏览器或其他程序，"
+                "确认 Windows 页面文件仍有可用空间后，再点击生成视频；"
+                "已完成的 OCR 和 AI 旁白不会丢失。"
+            )
         return False
     return True
 
@@ -1034,6 +1047,8 @@ def create_title_card(video_dir, font_path, title, subtitle, feature,
 def create_silent_video(title_path, frame_paths, title_duration, clip_durations,
                         video_dir, width=W, height=H, progress_cb=None):
     """clip_durations: 与 frame_paths 等长的每片段时长列表（秒）。"""
+    import gc
+
     video_path = os.path.join(video_dir, "silent_video.mp4")
     segments = []
     vf = (f"format=yuv420p,scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -1041,11 +1056,13 @@ def create_silent_video(title_path, frame_paths, title_duration, clip_durations,
     all_files = [(title_path, title_duration)] + list(zip(frame_paths, clip_durations))
     n = len(all_files)
     for i, (img_path, dur) in enumerate(all_files):
+        gc.collect()
         seg_path = os.path.join(video_dir, f"seg_{i:03d}.mp4")
         cmd = [
             "ffmpeg", "-y", "-loop", "1", "-i", img_path, "-t", str(dur),
             "-vf", vf,
             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-threads", os.getenv("MK_DZDY_X264_THREADS", "2"),
             "-pix_fmt", "yuv420p", "-r", "30", seg_path
         ]
         if not run_ffmpeg(cmd, f"segment {i+1}"):
@@ -1727,6 +1744,19 @@ def build_srt(narration, clip_durations, raw_durs, title_duration):
     return build_srt_from_cues(cues)
 
 
+def convert_cues_to_traditional(cues):
+    """Convert caption text from Simplified Chinese to Traditional Chinese."""
+    try:
+        from opencc import OpenCC
+    except ImportError as e:
+        raise RuntimeError(
+            "生成繁体中文字幕需要 OpenCC，请执行: "
+            "py -3.14 -m pip install opencc-python-reimplemented"
+        ) from e
+    converter = OpenCC("s2t")
+    return [dict(cue, text=converter.convert(cue["text"])) for cue in cues]
+
+
 class _TranslationCountError(RuntimeError):
     pass
 
@@ -1953,7 +1983,9 @@ def burn_subtitles(video_in, srt_path, video_out, font_dir, font_name, height,
              "Bold=1,BorderStyle=1,Outline=2,Shadow=1,MarginV=40")
     vf = f"subtitles={srt_name}:fontsdir=.:force_style='{style}'"
     cmd = ["ffmpeg", "-y", "-i", os.path.abspath(video_in), "-vf", vf,
-           "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+           "-threads", os.getenv("MK_DZDY_X264_THREADS", "2"),
+           "-pix_fmt", "yuv420p",
            "-c:a", "copy", "-movflags", "+faststart", os.path.abspath(video_out)]
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=srt_dir)
     if result.returncode != 0:
@@ -1971,6 +2003,7 @@ def burn_ass_subtitles(video_in, ass_path, video_out, font_dir):
     vf = f"subtitles={ass_name}:fontsdir=."
     cmd = ["ffmpeg", "-y", "-i", os.path.abspath(video_in), "-vf", vf,
            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+           "-threads", os.getenv("MK_DZDY_X264_THREADS", "2"),
            "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
            os.path.abspath(video_out)]
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=ass_dir)
@@ -2109,7 +2142,7 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
     ass_path = os.path.splitext(out_path)[0] + ".ass"
     cues = []
     translations = []
-    if subtitle_mode in ("srt", "burn", "burn_bilingual"):
+    if subtitle_mode in ("srt", "srt_traditional", "burn", "burn_bilingual"):
         if progress_cb:
             progress_cb("merge", 0.93, "生成字幕(SRT)")
         cues = build_caption_cues(
@@ -2127,9 +2160,16 @@ def build_video(pdf_path, out_path, params, narration, progress_cb=None):
                 params.get("subtitle_outline_color", "#101010"))
             with open(ass_path, "w", encoding="utf-8-sig") as f:
                 f.write(ass_text)
+        elif subtitle_mode == "srt_traditional":
+            if progress_cb:
+                progress_cb("merge", 0.94, "转换繁体中文字幕")
+            cues = convert_cues_to_traditional(cues)
+            srt_text = build_srt_from_cues(cues)
         else:
             srt_text = build_srt_from_cues(cues)
-        with open(srt_path, "w", encoding="utf-8") as f:
+        srt_encoding = ("utf-8-sig" if subtitle_mode == "srt_traditional"
+                        else "utf-8")
+        with open(srt_path, "w", encoding=srt_encoding) as f:
             f.write(srt_text)
 
     # Step 7: 合成

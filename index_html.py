@@ -312,6 +312,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <select id="subtitle_mode">
           <option value="none" selected>不生成字幕</option>
           <option value="srt">生成 SRT 字幕文件（随视频单独下载）</option>
+          <option value="srt_traditional">生成 SRT 繁体中文字幕（随视频单独下载）</option>
           <option value="burn">把字幕烧进画面（硬字幕，始终显示）</option>
           <option value="burn_bilingual">中英双语硬字幕（英文由AI翻译）</option>
         </select>
@@ -1140,8 +1141,9 @@ function showCompletedTask(st){
     const srtParams=new URLSearchParams();
     if(st.asset_ticket) srtParams.set('ticket',st.asset_ticket);
     srtLink.href='/api/download_srt/'+encodeURIComponent(TASK_ID)+'?'+srtParams.toString();
-    srtLink.download='AI_PDF_subtitles.srt';
-    srtLink.textContent='下载 SRT 字幕'; links.append(sep,srtLink);
+    const traditional=st.srt_language==='zh-Hant';
+    srtLink.download=traditional?'AI_PDF_subtitles_zh-Hant.srt':'AI_PDF_subtitles.srt';
+    srtLink.textContent=traditional?'下载繁体中文 SRT 字幕':'下载 SRT 字幕'; links.append(sep,srtLink);
   }
   const coverSep=document.createTextNode('　');
   const coverLink=document.createElement('a');

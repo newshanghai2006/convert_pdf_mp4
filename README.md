@@ -18,7 +18,7 @@
 - **选择页码**：只做其中某些页，如 `1~10,15~20,30`。
 - **输出尺寸**：画面比例 16:9 / 9:16 / 4:3 / 1:1 / 自定义，清晰度 480/720/1080/1440；标题卡横竖屏自适应。
 - **封面实时预览**：保留经典自动版式，也可切换自定义字号，调整主标题、副标题、徽标、副信息和标语大小。
-- **字幕**：可生成 **SRT 文件**、单语硬字幕，或生成“中文在上、AI 英译在下”的双语硬字幕；中英文和描边颜色可选。
+- **字幕**：可生成简体或繁体中文 **SRT 文件**、单语硬字幕，或生成“中文在上、AI 英译在下”的双语硬字幕；中英文和描边颜色可选。
 - **兼容性**：输出 MP4 带 `+faststart`，下载后各播放器都能直接打开；成品完成后还可下载最终封面 PNG 图片。
 
 演示样例见 [`sample/`](sample/)：输入 `sample_in.pdf`（46 页扫描件）→ 输出 `sample_out.mp4`。
@@ -29,7 +29,7 @@
 
 - **Python 3.14**（用 `py -3.14`，或 `python`）
 - **ffmpeg**（含 `ffprobe`，需在 PATH）
-- Python 库：`flask` · `PyMuPDF` · `Pillow` · `edge-tts>=7.3.1` · `numpy`；本地 OCR 引擎按需安装 `easyocr`、`rapidocr_onnxruntime` 或 `paddleocr` / `paddlepaddle`
+- Python 库：`flask` · `PyMuPDF` · `Pillow` · `edge-tts>=7.3.1` · `numpy` · `opencc-python-reimplemented`；本地 OCR 引擎按需安装 `easyocr`、`rapidocr_onnxruntime` 或 `paddleocr` / `paddlepaddle`
 - 联网要求：**配音**需能访问微软语音服务；**OCR 首次**需联网下载模型（之后离线）
 
 ---
@@ -41,7 +41,7 @@
 winget install Gyan.FFmpeg          # 装完请重开终端使 PATH 生效
 
 # 2) 安装依赖
-py -3.14 -m pip install flask PyMuPDF Pillow "edge-tts>=7.3.1" numpy
+py -3.14 -m pip install flask PyMuPDF Pillow "edge-tts>=7.3.1" numpy opencc-python-reimplemented
 py -3.14 -m pip install easyocr     # 默认本地 OCR 引擎，可选
 # 也可以按需安装其它本地 OCR 引擎（二选一或都装）
 py -3.14 -m pip install rapidocr_onnxruntime
@@ -65,6 +65,13 @@ py -3.14 app.py
 ```
 
 `pip show` 输出的版本应不低于 `7.3.1`。正在运行的 Python 进程不会自动加载刚升级的库，因此升级后需要重启服务；已完成的 OCR 和 AI 旁白任务数据不会丢失。
+
+### 视频编码内存不足
+
+若日志同时出现 Werkzeug `MemoryError` 和 FFmpeg `Error submitting video frame to the encoder`，通常是
+Windows 的内存提交额度或页面文件已接近上限，并非对应 PDF 页面损坏。先关闭占用内存较多的浏览器、
+办公或同步程序，再对原任务点击「生成视频」；OCR 与 AI 旁白不需要重做。程序默认把 x264 编码线程限制为
+2 个以降低峰值内存，也可在启动前通过环境变量 `MK_DZDY_X264_THREADS` 调整。
 
 完整安装/排错见 [README_解说视频生成器.md](README_解说视频生成器.md)。
 
