@@ -37,6 +37,17 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 TASK_DB_PATH = os.path.join(UPLOAD_DIR, "tasks.db")
 
 
+def _download_filename(source_name, suffix):
+    """Build a browser-safe download name while preserving Unicode text."""
+    source_name = str(source_name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    stem = os.path.splitext(source_name)[0].strip()
+    stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", stem).rstrip(". ")
+    if not stem:
+        stem = "PDF"
+    # Leave room for the suffix and filesystem encoding expansion.
+    return stem[:180] + suffix
+
+
 def _positive_int_env(name, default):
     try:
         return max(1, int(os.environ.get(name, str(default))))
@@ -870,6 +881,7 @@ def api_status():
             "output_ready": st["output_ready"],
             "srt_ready": st.get("srt_ready", False),
             "srt_language": st.get("srt_language", ""),
+            "file_name": st.get("file_name", "PDF"),
             "voice": voice,
             "voice_label": VOICE_LABELS.get(voice, ""),
             "rate": generation_params.get("rate", ""),
@@ -1125,10 +1137,11 @@ def api_download(tid):
         if not st.get("output_ready"):
             return jsonify({"error": "not ready"}), 404
         out_path = st["output_path"]
+        download_name = _download_filename(st.get("file_name"), "_video.mp4")
     as_attachment = request.args.get("download") == "1"
     return send_file(out_path, mimetype="video/mp4",
                      as_attachment=as_attachment,
-                     download_name="AI_PDF_video.mp4",
+                     download_name=download_name,
                      conditional=True)
 
 
@@ -1142,13 +1155,15 @@ def api_download_srt(tid):
             return jsonify({"error": "not ready"}), 404
         srt_path = st.get("srt_path", "")
         srt_language = st.get("srt_language", "")
+        download_name = _download_filename(
+            st.get("file_name"),
+            ("_subtitles_zh-Hant.srt" if srt_language == "zh-Hant"
+             else "_subtitles.srt"))
     if not srt_path or not os.path.exists(srt_path):
         return jsonify({"error": "not found"}), 404
     return send_file(srt_path, mimetype="application/x-subrip",
                      as_attachment=True,
-                     download_name=("AI_PDF_subtitles_zh-Hant.srt"
-                                    if srt_language == "zh-Hant"
-                                    else "AI_PDF_subtitles.srt"),
+                     download_name=download_name,
                      conditional=True)
 
 
@@ -1162,6 +1177,7 @@ def api_download_cover(tid):
         if not st.get("output_ready"):
             return jsonify({"error": "not ready"}), 404
         out_path = st.get("output_path", "")
+        download_name = _download_filename(st.get("file_name"), "_cover.png")
     if not out_path:
         return jsonify({"error": "封面不存在"}), 404
     workdir = os.path.splitext(out_path)[0] + "_work"
@@ -1170,7 +1186,7 @@ def api_download_cover(tid):
         return jsonify({"error": "封面不存在"}), 404
     return send_file(cover_path, mimetype="image/png",
                      as_attachment=True,
-                     download_name="AI_PDF_cover.png",
+                     download_name=download_name,
                      conditional=True)
 
 

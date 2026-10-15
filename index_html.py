@@ -1128,11 +1128,16 @@ function showCompletedTask(st){
   if(st.asset_ticket) previewParams.set('ticket',st.asset_ticket);
   const v=$('video-preview'); v.src=downloadBase+'?'+previewParams.toString(); v.style.display='block';
   const links=$('out-links'); links.innerHTML='';
+  const rawSourceName=String(st.file_name||'PDF').replace(/\\/g,'/').split('/').pop();
+  const dotIndex=rawSourceName.lastIndexOf('.');
+  let downloadPrefix=(dotIndex>0?rawSourceName.slice(0,dotIndex):rawSourceName).trim();
+  downloadPrefix=downloadPrefix.replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').replace(/[. ]+$/g,'')||'PDF';
+  downloadPrefix=downloadPrefix.slice(0,180);
   const downloadParams=new URLSearchParams({download:'1'});
   if(st.asset_ticket) downloadParams.set('ticket',st.asset_ticket);
   const videoLink=document.createElement('a');
   videoLink.className='dl'; videoLink.href=downloadBase+'?'+downloadParams.toString();
-  videoLink.download='AI_PDF_video.mp4';
+  videoLink.download=downloadPrefix+'_video.mp4';
   videoLink.textContent='下载 MP4'; links.appendChild(videoLink);
   if(st.srt_ready){
     const sep=document.createTextNode('　');
@@ -1142,7 +1147,7 @@ function showCompletedTask(st){
     if(st.asset_ticket) srtParams.set('ticket',st.asset_ticket);
     srtLink.href='/api/download_srt/'+encodeURIComponent(TASK_ID)+'?'+srtParams.toString();
     const traditional=st.srt_language==='zh-Hant';
-    srtLink.download=traditional?'AI_PDF_subtitles_zh-Hant.srt':'AI_PDF_subtitles.srt';
+    srtLink.download=downloadPrefix+(traditional?'_subtitles_zh-Hant.srt':'_subtitles.srt');
     srtLink.textContent=traditional?'下载繁体中文 SRT 字幕':'下载 SRT 字幕'; links.append(sep,srtLink);
   }
   const coverSep=document.createTextNode('　');
@@ -1151,7 +1156,7 @@ function showCompletedTask(st){
   const coverParams=new URLSearchParams({download:'1'});
   if(st.asset_ticket) coverParams.set('ticket',st.asset_ticket);
   coverLink.href='/api/download_cover/'+encodeURIComponent(TASK_ID)+'?'+coverParams.toString();
-  coverLink.download='AI_PDF_cover.png';
+  coverLink.download=downloadPrefix+'_cover.png';
   coverLink.textContent='下载封面图片';
   links.append(coverSep,coverLink);
   $('status2').innerHTML='<span class="ok">完成！可预览/下载。</span>';
