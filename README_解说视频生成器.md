@@ -59,7 +59,7 @@ mk_dzdy/
 
 ```bat
 py -3.14 -m pip install --upgrade pip
-py -3.14 -m pip install flask PyMuPDF Pillow edge-tts numpy
+py -3.14 -m pip install flask PyMuPDF Pillow "edge-tts>=7.3.1" numpy
 ```
 
 **本地 OCR 是可选的**（只有纯图片/扫描 PDF 才需要）。三种本地引擎按需安装：
@@ -111,6 +111,8 @@ AI PDF解说视频生成器 启动自检
 
 - **配音（TTS）需要联网**：edge-tts 会调用微软语音服务（`speech.platform.bing.com`）。
   若公司网络/防火墙/代理把它挡住，就会报"无法连接"的错——见「八、常见问题」。
+  微软可能调整非公开语音接口；若联网正常但返回 HTTP 403，请先执行
+  `py -3.14 -m pip install --upgrade edge-tts`，再重启程序。
 - **OCR 首次需要联网**：easyocr 首次运行会下载识别模型（约 100+ MB）到 `~/.EasyOCR/model/`，
   下载后即可离线使用。
 
@@ -374,8 +376,9 @@ RapidOCR 会使用 ONNX 模型，PaddleOCR 也可能在首次运行时准备模�
   > 这一步需要联网，网络差会较久；模型准备好后即可离线运行。
 
 - **Q：生成视频时报"TTS 连接微软语音服务失败 / 无法连接 bing.com"？**
-  A：配音用的 edge-tts 需要访问微软的 `speech.platform.bing.com`。公司网络/防火墙/代理挡住它就会报这个错。
-  处理办法：① 换一个能正常上网的网络（或挂可用代理）后重试；② 确认系统代理设置正确。
+  A：先看原始错误。若是 `HTTP 403` 或 `Invalid response status`，通常是微软接口更新后旧版 edge-tts
+  的鉴权已失效；执行 `py -3.14 -m pip install --upgrade edge-tts`，重启程序后重试。若是连接超时、
+  DNS 或无法建立连接，再检查是否能访问 `speech.platform.bing.com`，以及防火墙和系统代理设置。
   说明：**个别**片段偶发失败会自动改为该片段静音并继续；只有**所有**旁白都失败（整体连不上）时才会报错中止。
 
 - **Q：OCR 很慢？**

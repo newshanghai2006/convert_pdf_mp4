@@ -114,9 +114,18 @@ def generate_tts_edge(text, output_wav, voice, rate):
             print(f"    edge-tts attempt {attempt} failed: {e}")
             time.sleep(2)
     else:
+        if "403" in last_err or "Invalid response status" in last_err:
+            hint = (
+                "微软已拒绝当前 edge-tts 客户端鉴权。请先执行 "
+                "py -3.14 -m pip install --upgrade edge-tts，随后重启本程序再重试。"
+            )
+        else:
+            hint = (
+                "请检查网络 / 防火墙 / 代理，确认能访问 "
+                "speech.platform.bing.com 后重试。"
+            )
         raise RuntimeError(
-            "TTS 连接微软语音服务失败（edge-tts 需能访问 speech.platform.bing.com）。"
-            "请检查网络 / 防火墙 / 代理，确认能联网后重试。原始错误: " + last_err)
+            "TTS 连接微软语音服务失败。" + hint + "原始错误: " + last_err)
     cmd = ["ffmpeg", "-y", "-i", tmp_mp3,
            "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", output_wav]
     ok = run_ffmpeg(cmd, "mp3->wav")

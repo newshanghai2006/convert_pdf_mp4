@@ -29,7 +29,7 @@
 
 - **Python 3.14**（用 `py -3.14`，或 `python`）
 - **ffmpeg**（含 `ffprobe`，需在 PATH）
-- Python 库：`flask` · `PyMuPDF` · `Pillow` · `edge-tts` · `numpy`；本地 OCR 引擎按需安装 `easyocr`、`rapidocr_onnxruntime` 或 `paddleocr` / `paddlepaddle`
+- Python 库：`flask` · `PyMuPDF` · `Pillow` · `edge-tts>=7.3.1` · `numpy`；本地 OCR 引擎按需安装 `easyocr`、`rapidocr_onnxruntime` 或 `paddleocr` / `paddlepaddle`
 - 联网要求：**配音**需能访问微软语音服务；**OCR 首次**需联网下载模型（之后离线）
 
 ---
@@ -41,7 +41,7 @@
 winget install Gyan.FFmpeg          # 装完请重开终端使 PATH 生效
 
 # 2) 安装依赖
-py -3.14 -m pip install flask PyMuPDF Pillow edge-tts numpy
+py -3.14 -m pip install flask PyMuPDF Pillow "edge-tts>=7.3.1" numpy
 py -3.14 -m pip install easyocr     # 默认本地 OCR 引擎，可选
 # 也可以按需安装其它本地 OCR 引擎（二选一或都装）
 py -3.14 -m pip install rapidocr_onnxruntime

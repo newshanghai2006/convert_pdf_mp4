@@ -1165,6 +1165,7 @@ def _preflight():
     """启动前自检：打印关键依赖状态，避免“运行无显示”一头雾水。"""
     import shutil
     import importlib.util
+    from importlib.metadata import PackageNotFoundError, version
     print("=" * 50, flush=True)
     print("AI PDF解说视频生成器 启动自检", flush=True)
     ff = shutil.which("ffmpeg")
@@ -1175,7 +1176,20 @@ def _preflight():
                 "rapidocr_onnxruntime", "paddleocr", "paddle"):
         try:
             ok = importlib.util.find_spec(mod) is not None
-            print(f"  {mod:8s}: {'OK' if ok else '未安装'}", flush=True)
+            status = "OK" if ok else "未安装"
+            if mod == "edge_tts" and ok:
+                try:
+                    installed = version("edge-tts")
+                    parts = tuple(
+                        int(item) for item in installed.split(".")[:3]
+                        if item.isdigit()
+                    )
+                    status = "OK " + installed
+                    if parts < (7, 3, 1):
+                        status += "（版本过旧，请执行 pip install --upgrade edge-tts）"
+                except PackageNotFoundError:
+                    pass
+            print(f"  {mod:8s}: {status}", flush=True)
         except Exception as e:
             print(f"  {mod:8s}: 检查失败! {e}", flush=True)
     print("=" * 50, flush=True)
