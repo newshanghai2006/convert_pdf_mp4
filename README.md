@@ -53,6 +53,19 @@ py -3.14 app.py
 
 启动时会打印依赖自检；随后浏览器打开 **http://127.0.0.1:5006** 即可使用（仅本机访问）。
 
+### edge-tts 升级与 403 处理
+
+如果网络正常，但生成配音时报 `HTTP 403` 或 `Invalid response status`，通常是微软接口更新后旧版
+`edge-tts` 的鉴权已经失效。关闭当前服务后执行：
+
+```powershell
+py -3.14 -m pip install --upgrade edge-tts
+py -3.14 -m pip show edge-tts
+py -3.14 app.py
+```
+
+`pip show` 输出的版本应不低于 `7.3.1`。正在运行的 Python 进程不会自动加载刚升级的库，因此升级后需要重启服务；已完成的 OCR 和 AI 旁白任务数据不会丢失。
+
 完整安装/排错见 [README_解说视频生成器.md](README_解说视频生成器.md)。
 
 ---
