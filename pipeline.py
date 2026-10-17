@@ -222,7 +222,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
                        ocr_worker=None, py_exe=None, ocr_lang="ch_sim",
                        probe_ocr=False, ai_ocr_cfg=None,
                        ocr_engine="easyocr", ocr_layout_mode="auto",
-                       ocr_spread_order="ltr"):
+                       ocr_spread_order="ltr", ocr_text_orientation="auto",
+                       ocr_reading_order="auto"):
     """返回 list[str]，每页一段文字。文字层优先；若全空且 use_ocr，则跑 OCR。
     ocr_lang: 'ch_sim'(简体) 或 'ch_tra'(繁体)，均搭配英文。"""
     doc = fitz.open(pdf_path)
@@ -248,7 +249,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
                 os.remove(out_txt)
             ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
                                ocr_lang, ocr_engine, ocr_layout_mode,
-                               ocr_spread_order)
+                               ocr_spread_order, ocr_text_orientation,
+                               ocr_reading_order)
             return parse_ocr_txt(out_txt, N)
 
         # 样本里有文字层，再做全量提取
@@ -289,7 +291,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
 
     if (ai_ocr_cfg or {}).get("enabled"):
         return generate_ai_ocr(pdf_path, pages, ai_ocr_cfg, progress_cb,
-                               ocr_layout_mode, ocr_spread_order)
+                               ocr_layout_mode, ocr_spread_order,
+                               ocr_text_orientation, ocr_reading_order)
 
     # OCR 结果放在任务自己的目录下（不再用进程 PID 命名的公共临时文件，
     # 否则同一 Flask 进程里并发的两个任务会写到同一个文件、互相污染）。
@@ -298,7 +301,8 @@ def extract_page_texts(pdf_path, use_ocr=False, progress_cb=None,
         os.remove(out_txt)
     ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
                        ocr_lang, ocr_engine, ocr_layout_mode,
-                       ocr_spread_order)
+                       ocr_spread_order, ocr_text_orientation,
+                       ocr_reading_order)
     return parse_ocr_txt(out_txt, N)
 
 
@@ -313,7 +317,8 @@ def get_pdf_page_count(pdf_path):
 
 def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
                        ocr_lang="ch_sim", ocr_engine="easyocr",
-                       ocr_layout_mode="auto", ocr_spread_order="ltr"):
+                       ocr_layout_mode="auto", ocr_spread_order="ltr",
+                       ocr_text_orientation="auto", ocr_reading_order="auto"):
     """
     以子进程跑 OCR。一次子进程处理「所有剩余页」，把 torch/easyocr 的加载成本
     只付一次；子进程中途崩溃则重新拉起、从断点续跑。
@@ -333,6 +338,10 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
         ocr_layout_mode = "auto"
     if ocr_spread_order not in ("ltr", "rtl"):
         ocr_spread_order = "ltr"
+    if ocr_text_orientation not in ("auto", "horizontal", "vertical"):
+        ocr_text_orientation = "auto"
+    if ocr_reading_order not in ("auto", "ltr", "rtl"):
+        ocr_reading_order = "auto"
     N = fitz.open(pdf_path).page_count
     max_stalls = 3           # 连续无进展的最大次数
     stalls = 0
@@ -371,7 +380,8 @@ def ocr_pdf_subprocess(pdf_path, out_txt, progress_cb, ocr_worker, py_exe,
             ef = open(err_log, "w", encoding="utf-8", errors="replace")
             proc = subprocess.Popen(
                 [py_exe, ocr_worker, pdf_path, str(done), str(N), out_txt,
-                 ocr_lang, ocr_engine, ocr_layout_mode, ocr_spread_order],
+                 ocr_lang, ocr_engine, ocr_layout_mode, ocr_spread_order,
+                 ocr_text_orientation, ocr_reading_order],
                 stdout=subprocess.DEVNULL, stderr=ef, text=True, env=env)
         except Exception as e:
             last_err = f"无法启动 OCR 子进程: {e}"
@@ -1216,7 +1226,8 @@ def _pdf_page_images(page, layout_mode="auto", spread_order="ltr"):
 
 
 def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None,
-                    layout_mode="auto", spread_order="ltr"):
+                    layout_mode="auto", spread_order="ltr",
+                    text_orientation="auto", reading_order="auto"):
     """Recognize image-only PDF pages through an OpenAI-compatible vision model."""
     base_url = (llm_cfg or {}).get("base_url", "")
     api_key = (llm_cfg or {}).get("api_key", "")
@@ -1232,9 +1243,20 @@ def generate_ai_ocr(pdf_path, fallback_pages, llm_cfg, progress_cb=None,
         "magazine": "这是多栏杂志版面，请先识别独立版块和分栏，再按版块阅读顺序输出。",
         "auto": "请判断单页、多栏或左右跨页结构，并按实际版面的正常阅读顺序输出。",
     }.get(layout_mode, "请按实际版面的正常阅读顺序输出。")
+    orientation_instruction = {
+        "horizontal": "页面文字为横排；同一行按指定方向阅读，各行从上到下。",
+        "vertical": "页面文字为竖排；每列必须从上到下阅读，再按指定方向排列各列。",
+        "auto": "请逐个版块判断文字是横排还是竖排，混合版面也要分别按各自方向读取。",
+    }.get(text_orientation, "请判断文字排列方向。")
+    order_instruction = {
+        "ltr": "栏、列及同一横行的总体阅读顺序为从左到右。",
+        "rtl": "栏、列及同一横行的总体阅读顺序为从右到左。",
+        "auto": "请根据版面判断左右阅读顺序；现代横排通常从左到右，传统竖排通常从右到左。",
+    }.get(reading_order, "请根据版面判断左右阅读顺序。")
     prompts = (
         "请准确识别 PDF 页面中的所有可见文字。" + layout_instruction +
-        "同一栏内从上到下，多栏按栏依次处理；标题、正文和图片说明不要互相穿插。"
+        orientation_instruction + order_instruction +
+        "标题、正文和图片说明不要互相穿插。"
         "用空行分隔不同版块，尽量保留标题、段落和换行；不要补写图片中没有的内容，"
         "不要解释识别过程。如果页面主要是图片且没有文字，只输出空文本。"
     )

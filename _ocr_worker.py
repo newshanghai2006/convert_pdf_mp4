@@ -14,7 +14,7 @@ OCR worker：被 pipeline.ocr_pdf_subprocess 以子进程方式调用。
     （避免 JPEG 压缩损失，也不再残留 _ocr_tmp_*.jpg）。
 
 用法: py _ocr_worker.py <pdf> <start> <end> <out_txt> [lang] [engine]
-      [layout_mode] [spread_order]
+      [layout_mode] [spread_order] [text_orientation] [reading_order]
       start/end 为 0-based 索引（end 不含），engine 默认为 easyocr
 """
 import sys
@@ -32,7 +32,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import numpy as np
 import fitz
 from PIL import Image
-from _ocr_layout import detect_spread_split, layout_groups, make_record
+from _ocr_layout import (detect_spread_split, detect_text_orientation,
+                         layout_groups, make_record)
 
 PDF = sys.argv[1]
 START = int(sys.argv[2])
@@ -52,6 +53,12 @@ if LAYOUT_MODE not in ("auto", "single", "spread", "magazine"):
 SPREAD_ORDER = sys.argv[8].strip().lower() if len(sys.argv) > 8 else "ltr"
 if SPREAD_ORDER not in ("ltr", "rtl"):
     SPREAD_ORDER = "ltr"
+TEXT_ORIENTATION = sys.argv[9].strip().lower() if len(sys.argv) > 9 else "auto"
+if TEXT_ORIENTATION not in ("auto", "horizontal", "vertical"):
+    TEXT_ORIENTATION = "auto"
+READING_ORDER = sys.argv[10].strip().lower() if len(sys.argv) > 10 else "auto"
+if READING_ORDER not in ("auto", "ltr", "rtl"):
+    READING_ORDER = "auto"
 
 # 渲染分辨率：越高越清晰但越慢、越费内存。
 RENDER_ZOOM = float(os.getenv("OCR_RENDER_ZOOM", str(150 / 72.0)))
@@ -249,13 +256,20 @@ def recognize_records(image, reader):
 
 def _format_region(image, reader, label=None, multi_column=True):
     records = recognize_records(image, reader)
+    orientation = (detect_text_orientation(records)
+                   if TEXT_ORIENTATION == "auto" else TEXT_ORIENTATION)
     groups = layout_groups(records, image.width, image.height,
-                           multi_column=multi_column)
+                           multi_column=multi_column,
+                           text_orientation=orientation,
+                           reading_order=READING_ORDER)
     parts = [f"【{label}】"] if label else []
     for index, group in enumerate(groups):
         if len(groups) > 1:
             parts.append(f"【版块 {index + 1}】")
-        parts.extend(item["text"] for item in group)
+        if orientation == "vertical":
+            parts.append("".join(item["text"] for item in group))
+        else:
+            parts.extend(item["text"] for item in group)
         if index + 1 < len(groups):
             parts.append("")
     return parts
