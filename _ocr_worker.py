@@ -22,6 +22,29 @@ import os
 import re
 import gc
 import json
+import socket
+
+
+def _prime_windows_platform_cache():
+    """Avoid Python 3.14 platform.system() hanging in a broken WMI query."""
+    if sys.platform != "win32":
+        return
+    import platform
+    if getattr(platform, "_uname_cache", None) is not None:
+        return
+    version_info = sys.getwindowsversion()
+    version = (f"{version_info.major}.{version_info.minor}."
+               f"{version_info.build}")
+    if version_info.major == 10:
+        release = "11" if version_info.build >= 22000 else "10"
+    else:
+        release = str(version_info.major)
+    platform._uname_cache = platform.uname_result(
+        "Windows", socket.gethostname(), release, version,
+        os.environ.get("PROCESSOR_ARCHITECTURE", ""))
+
+
+_prime_windows_platform_cache()
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")

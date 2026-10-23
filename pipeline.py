@@ -22,8 +22,31 @@ import math
 import asyncio
 import threading
 import subprocess
+import socket
 from urllib import request as urlrequest
 from urllib import error as urlerror
+
+
+def _prime_windows_platform_cache():
+    """Avoid Python 3.14 platform.system() hanging in a broken WMI query."""
+    if sys.platform != "win32":
+        return
+    import platform
+    if getattr(platform, "_uname_cache", None) is not None:
+        return
+    version_info = sys.getwindowsversion()
+    version = (f"{version_info.major}.{version_info.minor}."
+               f"{version_info.build}")
+    if version_info.major == 10:
+        release = "11" if version_info.build >= 22000 else "10"
+    else:
+        release = str(version_info.major)
+    platform._uname_cache = platform.uname_result(
+        "Windows", socket.gethostname(), release, version,
+        os.environ.get("PROCESSOR_ARCHITECTURE", ""))
+
+
+_prime_windows_platform_cache()
 
 import fitz
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -189,12 +212,19 @@ def build_selected_pdf(src_path, out_path, pages0):
     """按 0-based 页索引（保持顺序）抽取子 PDF 到 out_path，返回 out_path。"""
     src = fitz.open(src_path)
     new = fitz.open()
-    for p in pages0:
-        if 0 <= p < src.page_count:
-            new.insert_pdf(src, from_page=p, to_page=p)
-    new.save(out_path)
-    new.close()
-    src.close()
+    try:
+        valid_pages = [p for p in pages0 if 0 <= p < src.page_count]
+        for index, p in enumerate(valid_pages):
+            # Reuse MuPDF's graft map across inserts from the same source.
+            # Without final=False, image-heavy scanned PDFs can duplicate all
+            # shared resources per page and inflate a small PDF into gigabytes.
+            new.insert_pdf(
+                src, from_page=p, to_page=p,
+                final=(index == len(valid_pages) - 1))
+        new.save(out_path, garbage=3, deflate=True)
+    finally:
+        new.close()
+        src.close()
     return out_path
 
 
